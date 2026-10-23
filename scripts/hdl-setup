@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Create an initial HDL filelist and configure a single-folder VS Code workspace."""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+SOURCE_SUFFIXES = {".v", ".vl", ".sv"}
+HEADER_SUFFIXES = {".vh", ".svh"}
+FILELIST = ".vscode/hdl.f"
+
+
+def tokens(text):
+    result = []
+    i = 0
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i + 2)
+            i = len(text) if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                raise ValueError("unterminated comment in settings.json")
+            i = end + 2
+        elif text[i] == '"':
+            start = i
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            else:
+                raise ValueError("unterminated string in settings.json")
+            result.append(("string", json.loads(text[start:i]), start, i))
+        elif text[i] in "{}[]:,":
+            result.append((text[i], text[i], i, i + 1))
+            i += 1
+        else:
+            start = i
+            while i < len(text) and not text[i].isspace() and text[i] not in '{}[]:,"':
+                if text.startswith("//", i) or text.startswith("/*", i):
+                    break
+                i += 1
+            result.append(("atom", text[start:i], start, i))
+    return result
+
+
+def update_settings(text, values):
+    items = tokens(text)
+    if len(items) < 2 or items[0][0] != "{" or items[-1][0] != "}":
+        raise ValueError("settings.json must contain one top-level object")
+
+    depths = []
+    stack = []
+    for kind, _, _, _ in items:
+        depths.append(len(stack))
+        if kind in ("{", "["):
+            stack.append(kind)
+        elif kind in ("}", "]"):
+            if not stack or (stack.pop(), kind) not in (("{", "}"), ("[", "]")):
+                raise ValueError("unbalanced brackets in settings.json")
+    if stack:
+        raise ValueError("unbalanced brackets in settings.json")
+
+    edits = []
+    missing = dict(values)
+    for i, (kind, name, _, _) in enumerate(items[:-2]):
+        if depths[i] != 1 or kind != "string" or name not in values or items[i + 1][0] != ":":
+            continue
+        if name not in missing:
+            raise ValueError("duplicate setting: " + name)
+        start_index = i + 2
+        end_index = start_index
+        while end_index < len(items) and not (depths[end_index] == 1 and items[end_index][0] in (",", "}")):
+            end_index += 1
+        if end_index == start_index:
+            raise ValueError("missing value for setting: " + name)
+        edits.append((items[start_index][2], items[end_index - 1][3], json.dumps(values[name])))
+        del missing[name]
+
+    if missing:
+        before_close = items[-2][0]
+        separator = "" if before_close in ("{", ",") else ","
+        lines = ["  " + json.dumps(key) + ": " + json.dumps(value) for key, value in missing.items()]
+        edits.append((items[-1][2], items[-1][2], separator + "\n" + ",\n".join(lines) + "\n"))
+
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def quoted_path(path):
+    if any(char in path for char in ('"', "\\", "$", "#", "\n", "\r")):
+        raise ValueError("unsupported character in HDL path: " + path)
+    return '"' + path + '"'
+
+
+def make_filelist(root):
+    sources = []
+    includes = set()
+    for directory, subdirs, names in os.walk(root):
+        subdirs[:] = sorted(name for name in subdirs if name not in (".git", ".vscode"))
+        for name in names:
+            path = Path(directory, name)
+            relative = path.relative_to(root).as_posix()
+            if path.suffix.lower() in SOURCE_SUFFIXES:
+                sources.append(quoted_path(relative))
+            elif path.suffix.lower() in HEADER_SUFFIXES:
+                includes.add(quoted_path(path.parent.relative_to(root).as_posix()))
+    if not sources:
+        raise ValueError("no .v, .vl or .sv source files found in " + str(root))
+    lines = ["# Initial HDL inventory; edit source selection, include paths and macros as needed."]
+    lines += ["-I " + item for item in sorted(includes)]
+    lines += sorted(sources)
+    return "\n".join(lines) + "\n", len(sources)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="Set up a single-folder HDL workspace")
+    parser.add_argument("workspace", type=Path)
+    split = argv.index("--") if "--" in argv else len(argv)
+    before = argv[:split]
+    lint_args = argv[split + 1:] if split < len(argv) else None
+    args = parser.parse_args(before)
+    root = args.workspace.resolve()
+    if not root.is_dir():
+        parser.error("workspace is not a directory: " + str(root))
+
+    settings_path = root / ".vscode/settings.json"
+    filelist_path = root / FILELIST
+    filelist = None
+    count = None
+    if filelist_path.exists() and not filelist_path.is_file():
+        raise ValueError("filelist path is not a file: " + str(filelist_path))
+    if not filelist_path.exists():
+        filelist, count = make_filelist(root)
+    values = {
+        "verilog.legacy.filelist": FILELIST,
+        "verilog.legacy.linter": "slang",
+        "verilog.legacy.linterPath": "",
+        "verilog.legacy.ctagsPath": "ctags",
+    }
+    if lint_args is not None:
+        values["verilog.legacy.lintArgs"] = lint_args
+    existing = settings_path.read_text() if settings_path.exists() else "{}\n"
+    settings = update_settings(existing, values)
+
+    settings_path.parent.mkdir(exist_ok=True)
+    if filelist is not None:
+        filelist_path.write_text(filelist)
+        print("Created " + str(filelist_path) + " with " + str(count) + " source files")
+    else:
+        print("Kept existing " + str(filelist_path))
+    if settings != existing or not settings_path.exists():
+        settings_path.write_text(settings)
+    print("Configured " + str(settings_path))
+    print("Review the filelist, then run 'Verilog Legacy: Reindex Workspace' in VS Code.")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (OSError, ValueError) as error:
+        print("hdl-setup: " + str(error), file=sys.stderr)
+        sys.exit(1)
