@@ -31,6 +31,11 @@
     Include paths to pass as -I to tools
 
 
+- `verilog.filelist`: string = ""
+
+    Project filelist relative to the workspace root. Its source files are indexed, +incdir+/-I directories are searched for includes, +define+/-D macros select the active `ifdef branches, and linters get it with -f instead of the current file. Run Reindex after editing it.
+
+
 - `verilog.moduleGlobs`: array = []
 
     Globs for finding verilog modules, interfaces, and packages for use with the common -y flag
@@ -38,7 +43,7 @@
 
 - `verilog.includeGlobs`: array = []
 
-    Globs for finding verilog include files (typically svh), used for definition providing. If set to [], it will source from verilog.includes
+    Globs for finding verilog include files (typically svh/vh), used for definition providing. If set to [], it will source from verilog.includes
 
 
 - `verilog.excludeGlob`: string = ""

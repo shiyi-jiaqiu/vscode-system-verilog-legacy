@@ -1,5 +1,6 @@
 import * as vscode from 'vscode'
 import { LanguageClient, LanguageClientOptions, ServerOptions } from 'vscode-languageclient/node'
+import { ext } from './extension'
 import { CommandNode, ConfigObject, ExtensionComponent } from './lib/libconfig'
 import { anyVerilogSelector, systemverilogSelector } from './utils'
 
@@ -95,6 +96,10 @@ export class LanguageServerComponent extends ExtensionComponent {
     const selection = this.server.getValue()
     if (selection === LanguageServers.Ctags) {
       this.logger.info('Ctags language server selected... no server to client to set up')
+      return
+    }
+    if (ext.slangExtensionActive()) {
+      this.logger.info('vscode-slang is active, not starting ' + selection)
       return
     }
     const serverOptions: ServerOptions = {

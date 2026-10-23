@@ -568,6 +568,7 @@ export class ProjectComponent
   constructor() {
     super({
       name: 'Hierarchy',
+      when: '!verilog.slangExtensionActive',
       welcome: {
         contents: '[Select top level](command:verilog.project.selectTopLevel)',
       },

@@ -144,13 +144,13 @@ def main(argv):
     if not filelist_path.exists():
         filelist, count = make_filelist(root)
     values = {
-        "verilog.legacy.filelist": FILELIST,
-        "verilog.legacy.linter": "slang",
-        "verilog.legacy.linterPath": "",
-        "verilog.legacy.ctagsPath": "ctags",
+        "verilog.filelist": FILELIST,
+        "verilog.ctags.path": "ctags",
+        "verilog.lint.slang.enabled": True,
+        "verilog.lint.slang.path": "slang",
     }
     if lint_args is not None:
-        values["verilog.legacy.lintArgs"] = lint_args
+        values["verilog.lint.slang.args"] = " ".join(lint_args)
     existing = settings_path.read_text() if settings_path.exists() else "{}\n"
     settings = update_settings(existing, values)
 
@@ -163,7 +163,7 @@ def main(argv):
     if settings != existing or not settings_path.exists():
         settings_path.write_text(settings)
     print("Configured " + str(settings_path))
-    print("Review the filelist, then run 'Verilog Legacy: Reindex Workspace' in VS Code.")
+    print("Review the filelist, then run 'Verilog: Reindex' in VS Code.")
 
 
 if __name__ == "__main__":

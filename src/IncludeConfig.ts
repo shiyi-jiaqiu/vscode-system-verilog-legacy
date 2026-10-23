@@ -1,4 +1,5 @@
 import path from 'path'
+import { ext } from './extension'
 import { ConfigObject } from './lib/libconfig'
 import { getWorkspaceFolder } from './utils'
 import fs = require('fs')
@@ -43,7 +44,7 @@ export class IncludeConfig extends ConfigObject<string[]> {
   }
 
   private async resolveIncludes(p: string): Promise<string | undefined> {
-    for (let incdir of this.getValue()) {
+    for (let incdir of this.getValue().concat(ext.projectFilelist?.incdirs ?? [])) {
       let fullpath: string
       if (path.isAbsolute(incdir)) {
         fullpath = path.join(incdir, p)

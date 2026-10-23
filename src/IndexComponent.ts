@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
+import * as child_process from 'child_process'
 import * as vscode from 'vscode'
 import { Symbol } from './analysis/Symbol'
 import { VerilogDoc } from './analysis/VerilogDoc'
 import { ext } from './extension'
 import { ConfigObject, ExtensionComponent } from './lib/libconfig'
-import { getParentText, getPrevChar } from './utils'
+import { getParentText, getPrevChar, isAnyVerilog } from './utils'
 import fs = require('fs')
 import path = require('path')
 
@@ -31,6 +32,11 @@ export class IndexComponent extends ExtensionComponent {
   /// symbol name -> global symbols loaded from includes/*.svh
   readonly symbolMap: Map<string, Symbol[]> = new Map()
 
+  /// module/interface/package/class/program name -> ctags kind, from all indexed files
+  readonly unitKinds: Map<string, string> = new Map()
+  /// `define name -> files defining it, from all indexed files and headers
+  readonly macroFiles: Map<string, vscode.Uri[]> = new Map()
+
   async activate(context: vscode.ExtensionContext): Promise<void> {
     this.logger.info('Index Activating')
 
@@ -43,6 +49,9 @@ export class IndexComponent extends ExtensionComponent {
       vscode.workspace.onDidSaveTextDocument((doc: vscode.TextDocument) => {
         this.indexFile(doc.uri)
         this.getVerilogDoc(doc).clearSymbols()
+        if (isAnyVerilog(doc.languageId)) {
+          this.indexNames([doc.uri])
+        }
       })
     )
     context.subscriptions.push(
@@ -122,6 +131,10 @@ export class IndexComponent extends ExtensionComponent {
 
     let files: vscode.Uri[] = await ext.findModules()
     this.logger.info('indexing ' + files.length + ' files')
+    if (reset) {
+      this.unitKinds.clear()
+      this.macroFiles.clear()
+    }
 
     await vscode.window.withProgress(
       {
@@ -133,6 +146,8 @@ export class IndexComponent extends ExtensionComponent {
         for (let file of files) {
           this.indexMem(file)
         }
+        // after indexMem, so real unit names win over file names
+        await this.indexNames(files.concat(await ext.findIncludes()))
         if (this.enableSymlinks.getValue() && dir !== undefined) {
           let promises = files.map((file) => {
             this.indexSym(dir, file)
@@ -141,6 +156,75 @@ export class IndexComponent extends ExtensionComponent {
         }
       }
     )
+  }
+
+  /// One ctags pass over the files for design unit and macro names. Units are often not in a
+  /// file of the same name, and macros are often defined in a .v/.vh file another file includes.
+  async indexNames(files: vscode.Uri[]): Promise<void> {
+    if (files.length === 0) {
+      return
+    }
+    const command = await ext.ctags.path.getValueAsync()
+    const args =
+      '-f - --fields=+K --sort=no --excmd=n --kinds-SystemVerilog=mIKCPd --kinds-Verilog=md -L -'
+    const stdout = await new Promise<string>((resolve) => {
+      const proc = child_process.execFile(
+        command,
+        args.split(' '),
+        { encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024 },
+        (error, out) => {
+          if (error !== null) {
+            this.logger.error(`ctags name index failed: ${error}`)
+          }
+          resolve(out)
+        }
+      )
+      proc.stdin?.end(files.map((file) => file.fsPath).join('\n') + '\n')
+    })
+    const updated = new Set(files.map((file) => file.fsPath))
+    for (const [name, uris] of this.macroFiles) {
+      this.macroFiles.set(
+        name,
+        uris.filter((uri) => !updated.has(uri.fsPath))
+      )
+    }
+    let count = 0
+    for (const line of stdout.split(/\r?\n/)) {
+      const [name, file, , kind] = line.split('\t')
+      if (kind === undefined) {
+        continue
+      }
+      const uri = vscode.Uri.file(file)
+      if (kind === 'define') {
+        const uris = this.macroFiles.get(name) ?? []
+        if (!uris.some((u) => u.fsPath === uri.fsPath)) {
+          uris.push(uri)
+        }
+        this.macroFiles.set(name, uris)
+      } else {
+        this.moduleMap.set(name, uri)
+        this.unitKinds.set(name, kind)
+      }
+      count++
+    }
+    this.logger.info(`indexed ${count} unit and macro names in ${files.length} files`)
+  }
+
+  /// `define symbols named `name`, searching the current file first
+  async findMacro(document: vscode.TextDocument, name: string): Promise<Symbol[]> {
+    const local = (await this.getVerilogDoc(document).getSymbols({ name }, false)).filter((sym) =>
+      sym.isMacro()
+    )
+    if (local.length > 0) {
+      return local
+    }
+    const found: Symbol[] = []
+    for (const uri of this.macroFiles.get(name) ?? []) {
+      const doc = await vscode.workspace.openTextDocument(uri)
+      const syms = await this.getVerilogDoc(doc).getSymbols({ name }, false)
+      found.push(...syms.filter((sym) => sym.isMacro()))
+    }
+    return found
   }
 
   async indexIncludes(reset: boolean = false): Promise<void> {
@@ -252,7 +336,10 @@ export class IndexComponent extends ExtensionComponent {
     }
     let verilogDoc = this.getVerilogDoc(document)
     let targetText = document.getText(textRange)
-    let symPromise = verilogDoc.getSymbols({ name: targetText })
+    // symbol tree first, unitAt needs it
+    let symPromise = verilogDoc
+      .getSymbolTree()
+      .then(() => verilogDoc.findVisible(targetText, verilogDoc.unitAt(position)))
 
     let parentScope = getParentText(document, textRange)
     // let modulePromise = this.findDefinitionByName(parentScope, targetText);
@@ -278,6 +365,10 @@ export class IndexComponent extends ExtensionComponent {
 
     if (this.symbolMap.has(targetText)) {
       return this.symbolMap.get(targetText) ?? []
+    }
+
+    if (getPrevChar(document, textRange.start) === '`') {
+      return await this.findMacro(document, targetText)
     }
 
     if (this.moduleMap.has(targetText) || this.moduleMap.has(parentScope)) {

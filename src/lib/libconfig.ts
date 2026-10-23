@@ -445,6 +445,7 @@ export interface WelcomeSpec {
 export interface ViewSpec {
   // id: string // filled in automatically
   name: string
+  when?: string
   welcome?: WelcomeSpec
   type?: 'tree' | 'webview'
   initialSize?: number

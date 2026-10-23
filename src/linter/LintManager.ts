@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 import * as vscode from 'vscode'
+import { ext } from '../extension'
 import { ExtensionComponent } from '../lib/libconfig'
 import BaseLinter from './BaseLinter'
 import IcarusLinter from './IcarusLinter'
@@ -57,7 +58,8 @@ export default class LintManager extends ExtensionComponent {
   }
 
   async lint(doc: vscode.TextDocument) {
-    if (!isAnyVerilog(doc.languageId)) {
+    // vscode-slang reports diagnostics itself
+    if (!isAnyVerilog(doc.languageId) || ext.slangExtensionActive()) {
       return
     }
     let promises = Array.from(this.linters.values()).map((linter) => {

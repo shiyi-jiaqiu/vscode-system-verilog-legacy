@@ -117,12 +117,14 @@ export default abstract class BaseLinter extends ToolConfig {
         stdout: output.stdout,
         stderr: output.stderr,
       })
-      madeAdjustments = await this.makeAdjustments(targetUri.fsPath, diags)
+      // adjustments add per-file args, which filelist runs don't use
+      madeAdjustments =
+        ext.projectFilelist === undefined && (await this.makeAdjustments(targetUri.fsPath, diags))
       lintCount++
     } while (madeAdjustments && lintCount < 50)
 
-    // parse project level errors if top is set
-    if (ext.project.top && getWorkspaceUri() !== undefined) {
+    // parse project level errors if top or a filelist is set
+    if ((ext.project.top || ext.projectFilelist) && getWorkspaceUri() !== undefined) {
       let wsUri: vscode.Uri = getWorkspaceUri()!
       let fmap = new Map<string, FileDiagnostic[]>()
       for (let diag of diags) {
@@ -141,6 +143,8 @@ export default abstract class BaseLinter extends ToolConfig {
         if (file.includes('sv_cache')) {
           // resolve symlink
           uri = ext.index.findModuleUri(file) ?? vscode.Uri.file(await realpath(file))
+        } else if (path.isAbsolute(file)) {
+          uri = vscode.Uri.file(file)
         } else if (!file.startsWith(wsUri.fsPath)) {
           // relative to wsUri
           uri = vscode.Uri.joinPath(wsUri, file)
@@ -185,23 +189,31 @@ export default abstract class BaseLinter extends ToolConfig {
 
     let args: string[] = []
     args.push(...this.toolArgs(doc))
-    // -I folder + other includes
-    args.push(...this.formatIncludes([docFolder].concat(this.includeComputed)))
+    const filelist = ext.projectFilelist
+    if (filelist !== undefined) {
+      // the filelist names the sources, includes and defines of the whole project
+      args.push('-f', filelist.path)
+    } else {
+      // -I folder + other includes
+      args.push(...this.formatIncludes([docFolder].concat(this.includeComputed)))
+    }
     if (this.args.cachedValue !== '') {
       args.push(...this.args.cachedValue.trim().split(/\s+/))
     }
-    if (ext.index.enableSymlinks.cachedValue && this.indexDir !== undefined) {
-      args.push('-y')
-      args.push(this.indexDir.fsPath)
-    }
+    if (filelist === undefined) {
+      if (ext.index.enableSymlinks.cachedValue && this.indexDir !== undefined) {
+        args.push('-y')
+        args.push(this.indexDir.fsPath)
+      }
 
-    // Additional flags needed for this target
-    if (this.addArgs.has(targetUri.fsPath)) {
-      args.push(...(this.addArgs.get(targetUri.fsPath) ?? []))
-    }
+      // Additional flags needed for this target
+      if (this.addArgs.has(targetUri.fsPath)) {
+        args.push(...(this.addArgs.get(targetUri.fsPath) ?? []))
+      }
 
-    // top module
-    args.push(targetUri.fsPath)
+      // top module
+      args.push(targetUri.fsPath)
+    }
 
     let cwd: string | undefined = getWorkspaceFolder()
     if (this.runAtFileLocation.cachedValue === true) {

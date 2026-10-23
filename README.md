@@ -1,23 +1,53 @@
 # Verilog/SystemVerilog Legacy
 
-This branch adapts the [AndrewNolte Verilog/SystemVerilog extension](https://github.com/AndrewNolte/vscode-system-verilog) for VS Code 1.18.1 and has also been tested on VS Code 1.81.1. It retains the upstream TextMate grammars and snippets and provides workspace Ctags indexing, F12 definition lookup, hover, symbols, basic completion, and save-triggered Slang or Verilator diagnostics through the VS Code 1.18 API. The upstream MIT license is retained.
+This fork of the [AndrewNolte Verilog/SystemVerilog extension](https://github.com/AndrewNolte/vscode-system-verilog) targets VS Code 1.84 on servers without a semantic language server. It keeps the upstream TextMate grammars, snippets, Ctags index, linters, hierarchy view and formatters, and adds:
 
-Install the packaged VSIX with `code --install-extension verilog-systemverilog-legacy-0.1.0.vsix` on the machine running VS Code 1.18.1 or 1.81.1. Install Universal Ctags with JSON output support and either `slang` or `verilator` there as separate executables. The extension runs the tools on the same machine as its VS Code extension host.
+- **Hovers** show the declaration, the default value of parameters and object-like macros computed through other parameters, macros, imported packages and `pkg::` references (`= 2048 (0x800)`), the comment above or after the declaration, related parameters, and a link to the file and line.
+- **Go to definition** looks in the enclosing module first, then the rest of the file, then imported packages, so a port such as `clk_i` resolves to one place. Modules, interfaces and packages are found by name even when the file is named differently.
+- **Macros** from `.svh`, `.vh` and other source files are indexed, so `` `NAME `` hovers and jumps to its `` `define ``.
+- **Semantic highlighting** colors parameters, ports, signals, instances, types, modules and functions by what the index says they are.
+- **Filelist** support: `verilog.filelist` adds the listed sources to the index, its `+incdir+`/`-I` directories to include lookup, its `+define+`/`-D` macros to dim inactive `` `ifdef `` branches, and passes it to linters with `-f`.
 
-For a project with a tool filelist, set its path in VS Code settings. The filelist is passed to the linter with `-f`; source lines are also added to the Ctags index. All `.v`, `.vh`, `.sv`, and `.svh` files inside the opened workspace are indexed as well. Reindex manually after external dependencies or the filelist change.
+Values are computed lexically from defaults; parameter overrides at instantiations are not applied. Ctags runs on the editor text with macro calls blanked out, so a macro inside a port or parameter list no longer hides the rest of the list. A module whose name is itself a macro is not indexed.
+
+## Install
+
+```sh
+code --install-extension verilog-systemverilog-legacy-0.2.0.vsix
+```
+
+Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), and for linting [slang](https://github.com/MikePopoloski/slang) (or another linter supported upstream).
+
+## Configure
+
+For a single-folder workspace, `scripts/hdl-setup` (Python 3) writes an initial `.vscode/hdl.f` from the `.v`, `.vl` and `.sv` files and include directories it finds, and sets the extension's settings while keeping unrelated ones. Slang arguments go after `--`:
+
+```sh
+scripts/hdl-setup /path/to/workspace -- --top my_top -Wextra
+```
+
+The resulting settings, which can also be written by hand:
 
 ```json
 {
-  "verilog.legacy.ctagsPath": "/path/to/ctags-universal",
-  "verilog.legacy.filelist": ".vscode/rtl.f",
-  "verilog.legacy.linter": "slang",
-  "verilog.legacy.linterPath": "/path/to/slang",
-  "verilog.legacy.lintArgs": []
+  "verilog.filelist": ".vscode/hdl.f",
+  "verilog.ctags.path": "ctags",
+  "verilog.lint.slang.enabled": true,
+  "verilog.lint.slang.path": "slang",
+  "verilog.lint.slang.args": "--top my_top -Wextra"
 }
 ```
 
-For the RedMulE test repository, `bender checkout` followed by `mkdir -p .vscode && bender script flist-plus -t rtl > .vscode/rtl.f` produces an example project filelist. Open the repository root in VS Code. Use **Verilog Legacy: Reindex Workspace** after creating the filelist, and **Verilog Legacy: Lint Current File or Project** to run lint without saving. Lint runs on the whole filelist when one is configured, or on the saved file otherwise. Results appear in Problems; setup and command errors appear in the **Verilog Legacy** output channel.
+Review the generated filelist for the real source selection and macros, then run **Verilog: Reindex**. Reindex again after editing the filelist. Without a filelist, all `**/*.{sv,v}` and `**/*.{svh,vh}` files of the workspace are indexed and linters check the current file. The full list of settings is in [CONFIG.md](CONFIG.md).
 
-For a single-folder workspace without a filelist, run `scripts/hdl-setup /path/to/workspace` (Python 3 required). It creates an initial `.vscode/hdl.f` from `.v`, `.vl`, and `.sv` files, adds include directories containing `.vh` or `.svh`, and configures `.vscode/settings.json` for the filelist and the toolkit's `ctags` and `slang` commands while preserving unrelated settings. Run VS Code through the toolkit launcher, which puts those commands on PATH. Review the generated filelist for the project's actual source selection and macros. Optional Slang arguments go after `--`, for example `scripts/hdl-setup /path/to/workspace -- --top my_top -Wextra`; they become `verilog.legacy.lintArgs`. Running it again keeps an existing filelist and can update those arguments.
+Themes decide the colors of semantic tokens. Ports and instances use their own token types (`port`, `instance`), which fall back to parameter and variable colors; to give them distinct colors:
 
-This is a smaller implementation than the current upstream extension. Ctags locates lexical symbols, so conditional compilation and duplicate definitions can produce multiple F12 destinations. The current branch does not provide a module hierarchy or a SystemVerilog semantic language server.
+```json
+"editor.semanticTokenColorCustomizations": {
+  "rules": { "port": "#D7BA7D", "instance": { "italic": true } }
+}
+```
+
+## With vscode-slang
+
+When the [vscode-slang](https://github.com/hudson-trading/slang-server) extension is installed, this extension leaves hovers, definitions, completions, diagnostics, the hierarchy views and the language client to it and only adds semantic highlighting.

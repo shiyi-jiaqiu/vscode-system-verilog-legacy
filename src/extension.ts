@@ -7,8 +7,10 @@ import { glob } from 'glob'
 import path from 'path'
 import { promisify } from 'util'
 import { CtagsServerComponent } from './analysis/CtagsServerComponent'
+import { Filelist, readFilelist } from './Filelist'
 import { SystemVerilogFormatProvider, VerilogFormatProvider } from './FormatProvider'
 import { IncludeConfig } from './IncludeConfig'
+import { InactiveRegionsComponent } from './InactiveRegionsComponent'
 import { IndexComponent } from './IndexComponent'
 import { InlayHintsComponent } from './InlayHintsComponent'
 import {
@@ -20,6 +22,7 @@ import {
 } from './lib/libconfig'
 import LintManager from './linter/LintManager'
 import { LanguageServerComponent, LanguageServers } from './LSComponent'
+import { SemanticTokensComponent } from './SemanticTokensComponent'
 import { ProjectComponent } from './sidebar/ProjectComponent'
 import { getWorkspaceFolder, pathFilename, zip } from './utils'
 const asyncGlob = promisify(glob)
@@ -54,15 +57,21 @@ export class VerilogExtension extends ActivityBarComponent {
     description: 'Include paths to pass as -I to tools',
   })
 
+  filelist: ConfigObject<string> = new ConfigObject({
+    default: '',
+    description:
+      'Project filelist relative to the workspace root. Its source files are indexed, +incdir+/-I directories are searched for includes, +define+/-D macros select the active `ifdef branches, and linters get it with -f instead of the current file. Run Reindex after editing it.',
+  })
+
   moduleGlobs: ConfigObject<string[]> = new ConfigObject({
     default: ['**/*.{sv,v}'],
     description:
       'Globs for finding verilog modules, interfaces, and packages for use with the common -y flag',
   })
   includeGlobs: ConfigObject<string[]> = new ConfigObject({
-    default: ['**/*.{svh}'],
+    default: ['**/*.{svh,vh}'],
     description:
-      'Globs for finding verilog include files (typically svh), used for definition providing. If set to [], it will source from verilog.includes',
+      'Globs for finding verilog include files (typically svh/vh), used for definition providing. If set to [], it will source from verilog.includes',
   })
   excludeGlob: ConfigObject<string> = new ConfigObject({
     default: '',
@@ -101,6 +110,10 @@ export class VerilogExtension extends ActivityBarComponent {
 
   inlayHints: InlayHintsComponent = new InlayHintsComponent()
 
+  semanticTokens: SemanticTokensComponent = new SemanticTokensComponent()
+
+  inactiveRegions: InactiveRegionsComponent = new InactiveRegionsComponent()
+
   ////////////////////////////////////////////////
   /// top level commands
   ////////////////////////////////////////////////
@@ -109,6 +122,7 @@ export class VerilogExtension extends ActivityBarComponent {
       title: 'Reindex',
     },
     async () => {
+      this.loadFilelist()
       this.indexFiles(true)
         .then(() => {
           vscode.window.showInformationMessage('Reindexing complete')
@@ -255,6 +269,8 @@ export class VerilogExtension extends ActivityBarComponent {
   )
   expandDir: vscode.Uri | undefined = undefined
   context: vscode.ExtensionContext
+  /// parsed `verilog.filelist`, if one is configured
+  projectFilelist: Filelist | undefined = undefined
 
   constructor(context: vscode.ExtensionContext, obj: ViewContainerSpec) {
     super(obj)
@@ -262,6 +278,13 @@ export class VerilogExtension extends ActivityBarComponent {
   }
 
   async activate(context: vscode.ExtensionContext) {
+    // hides our views, vscode-slang has its own
+    vscode.commands.executeCommand(
+      'setContext',
+      'verilog.slangExtensionActive',
+      this.slangExtensionActive()
+    )
+    this.loadFilelist()
     // Lets do this quickly
     vscode.window.visibleTextEditors.forEach((editor) => {
       this.lint.lint(editor.document)
@@ -276,6 +299,7 @@ export class VerilogExtension extends ActivityBarComponent {
     /////////////////////////////////////////////
 
     this.onConfigUpdated(() => {
+      this.loadFilelist()
       this.checkFormatDirs()
     })
     await this.checkFormatDirs()
@@ -322,11 +346,38 @@ export class VerilogExtension extends ActivityBarComponent {
       .indexFiles(reset)
       .then(() => {
         this.logger.info('index files finished')
+        this.semanticTokens.refresh()
       })
       .catch((err) => {
         this.logger.error('index files failed:')
         this.logger.error(err)
       })
+  }
+
+  loadFilelist() {
+    this.projectFilelist = undefined
+    const configured = this.filelist.getValue()
+    const ws = getWorkspaceFolder()
+    if (configured === '' || ws === undefined) {
+      return
+    }
+    const file = path.resolve(ws, configured)
+    try {
+      this.projectFilelist = readFilelist(file, ws)
+      this.logger.info(
+        `filelist ${file}: ${this.projectFilelist.files.length} files, ${this.projectFilelist.incdirs.length} include dirs`
+      )
+    } catch (e) {
+      this.logger.error(`failed to read filelist ${file}: ${e}`)
+      vscode.window.showErrorMessage(`verilog.filelist: cannot read ${file}`)
+    }
+    this.inactiveRegions.update()
+  }
+
+  /// The Slang extension provides its own hovers, definitions, diagnostics and views,
+  /// so ours only add semantic highlighting next to it.
+  slangExtensionActive(): boolean {
+    return vscode.extensions.getExtension('Hudson-River-Trading.vscode-slang') !== undefined
   }
 
   ctagsEnabled(): boolean {
@@ -366,12 +417,21 @@ export class VerilogExtension extends ActivityBarComponent {
         return inc + '/*.svh'
       })
     }
-    return await this.findFiles(incGlobs)
+    const incdirs = this.projectFilelist?.incdirs ?? []
+    return uniqueUris(
+      await this.findFiles(incGlobs.concat(incdirs.map((dir) => dir + '/**/*.{svh,vh}')))
+    )
   }
 
   public async findModules(): Promise<vscode.Uri[]> {
-    return await this.findFiles(this.moduleGlobs.getValue())
+    const listed = (this.projectFilelist?.files ?? []).map((file) => vscode.Uri.file(file))
+    return uniqueUris((await this.findFiles(this.moduleGlobs.getValue())).concat(listed))
   }
+}
+
+// filelist entries and include directories may also match the workspace globs
+function uniqueUris(uris: vscode.Uri[]): vscode.Uri[] {
+  return Array.from(new Map(uris.map((uri) => [uri.fsPath, uri])).values())
 }
 
 export async function deactivate(): Promise<void> {

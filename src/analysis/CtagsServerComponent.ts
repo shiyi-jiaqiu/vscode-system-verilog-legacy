@@ -5,7 +5,13 @@ import { InlayPorts } from '../InlayHintsComponent'
 import { ExtensionComponent, ConfigObject, PathConfigObject } from '../lib/libconfig'
 import { anyVerilogSelector, getParentText, getPrev2Char, getPrevChar } from '../utils'
 import builtins from './builtins.json'
+import { getConstValue, getMacroBody } from './ConstValue'
 import { Symbol } from './Symbol'
+
+/// right hand side of `name = value` hover text, to skip repeating a literal value
+function getValueText(hover: string): string {
+  return hover.replace(/;\s*$/, '').split('=').slice(1).join('=').trim()
+}
 
 export class CtagsServerComponent
   extends ExtensionComponent
@@ -40,6 +46,10 @@ export class CtagsServerComponent
     // push provider subs to .v and .sv files
     if (!ext.ctagsEnabled()) {
       this.logger.info('Ctags indexing disabled, skipping registration')
+      return
+    }
+    if (ext.slangExtensionActive()) {
+      this.logger.info('vscode-slang is active, skipping ctags providers')
       return
     }
     this.loadBuiltins()
@@ -307,6 +317,14 @@ export class CtagsServerComponent
 
     let syms: Symbol[] = await ext.index.findSymbol(document, position)
     if (syms.length === 0) {
+      const define =
+        pchar === '`' ? ext.projectFilelist?.defines.get(document.getText(range)) : undefined
+      if (define !== undefined) {
+        let md = new vscode.MarkdownString()
+        md.appendCodeblock(`\`define ${document.getText(range)} ${define}`, document.languageId)
+        md.appendMarkdown('from `verilog.filelist`')
+        return new vscode.Hover(md)
+      }
       this.logger.warn('Hover object not found')
       return undefined
     }
@@ -314,14 +332,42 @@ export class CtagsServerComponent
     let sym = syms[0]
     let ctags = ext.index.getVerilogDoc(sym.doc)
 
-    let hovers = await ctags.getNestedHoverText(sym)
-    let mds = hovers.reverse().map((hover) => {
-      let md = new vscode.MarkdownString()
+    let [hover, ...related] = await ctags.getNestedHoverText(sym)
+    let md = new vscode.MarkdownString()
+    if (sym.type === 'instance' && sym.typeRef !== null) {
+      md.appendCodeblock(`${sym.typeRef} ${sym.name}`, document.languageId)
+    } else {
       md.appendCodeblock(hover, document.languageId)
-      return md
+    }
+    const value = await getConstValue(sym)
+    const written = sym.isMacro() ? getMacroBody(sym) : getValueText(hover)
+    if (value !== undefined && value.toString() !== written) {
+      md.appendMarkdown(
+        `= \`${value}\`` + (value >= 16n ? ` (\`0x${value.toString(16)}\`)` : '') + '\n\n'
+      )
+    }
+    const comment = sym.getDocComment()
+    if (comment !== '') {
+      // appendText would turn spaces into &nbsp;, which stops long comments from wrapping
+      md.appendMarkdown(
+        comment.replace(/[\\`*_{}[\]()#+\-.!|<>~]/g, '\\$&').replace(/\n/g, '  \n') + '\n\n'
+      )
+    }
+    let location = sym
+    if (sym.type === 'instance' && sym.typeRef !== null) {
+      location = (await ext.index.findModuleSymbol(sym.typeRef)) ?? sym
+    }
+    const target = location.doc.uri.with({ fragment: `L${location.line + 1}` })
+    md.appendMarkdown(
+      `[${vscode.workspace.asRelativePath(location.doc.uri)}:${location.line + 1}](${target})`
+    )
+    let mds = related.map((text) => {
+      let rmd = new vscode.MarkdownString()
+      rmd.appendCodeblock(text, document.languageId)
+      return rmd
     })
     this.logger.info('Hover object returned')
-    return new vscode.Hover(mds)
+    return new vscode.Hover([md, ...mds])
   }
 
   ////////////////////////////////////////////////

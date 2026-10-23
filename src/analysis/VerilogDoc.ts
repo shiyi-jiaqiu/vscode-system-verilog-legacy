@@ -1,4 +1,7 @@
 import * as child_process from 'child_process'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import * as vscode from 'vscode'
 import { ext } from '../extension'
 import { InlayPorts } from '../InlayHintsComponent'
@@ -19,6 +22,48 @@ function filterSymbols(symbols: Symbol[], filter: SymbolFilter): Symbol[] {
   }
   return symbols
 }
+
+const DIRECTIVES = new Set([
+  'define', 'undef', 'undefineall', 'ifdef', 'ifndef', 'elsif', 'else', 'endif', 'include',
+  'timescale', 'default_nettype', 'resetall', 'celldefine', 'endcelldefine', 'pragma', 'line',
+  'begin_keywords', 'end_keywords', 'unconnected_drive', 'nounconnected_drive',
+]) // prettier-ignore
+
+/// ctags does not expand macros, and a macro call inside a parameter or port list makes it
+/// drop the rest of that list. Blank out macro calls (keeping newlines, so line numbers
+/// still match). A call used as a declared name, `` `NAME(x) = 0 ``, becomes `_` so the
+/// declaration keeps its own name instead of taking the type's.
+function maskMacroCalls(text: string): string {
+  const blank = (s: string) => s.replace(/[^\n]/g, ' ')
+  const callRe = /`([A-Za-z_]\w*)/g
+  let out = ''
+  let last = 0
+  let match: RegExpExecArray | null
+  while ((match = callRe.exec(text)) !== null) {
+    if (DIRECTIVES.has(match[1])) {
+      continue
+    }
+    let end = callRe.lastIndex
+    if (text[end] === '(') {
+      // arguments up to the matching ')'; an unclosed call masks only the name
+      for (let i = end, depth = 0; i < text.length; i++) {
+        if (text[i] === '(') {
+          depth++
+        } else if (text[i] === ')' && --depth === 0) {
+          end = i + 1
+          break
+        }
+      }
+    }
+    const call = text.slice(match.index, end)
+    const declared = /^\s*=(?!=)/.test(text.slice(end, end + 80))
+    out += text.slice(last, match.index) + (declared ? '_' + blank(call.slice(1)) : blank(call))
+    last = callRe.lastIndex = end
+  }
+  return out + text.slice(last)
+}
+
+let ctagsInputCount = 0
 
 class VerilogPortHint extends vscode.InlayHint {
   implicit: boolean
@@ -64,7 +109,7 @@ export class VerilogDoc {
       this.logger.info('indexing ', this.doc.uri.fsPath)
       this.clearSymbols()
       // parse raw symbols
-      let output = await this.execCtags(this.doc.uri.fsPath)
+      let output = await this.execCtags()
       await this.buildSymbolsList(output)
       this.importSymbols = undefined
 
@@ -125,11 +170,18 @@ export class VerilogDoc {
     return syms
   }
 
-  async execCtags(filepath: string): Promise<string> {
+  async execCtags(): Promise<string> {
     let command: string = await ext.ctags.path.getValueAsync()
+    // Index the editor text, so unsaved edits are seen. The temp file keeps the
+    // extension, which selects the ctags parser.
+    const input = path.join(
+      os.tmpdir(),
+      `vscode-verilog-${process.pid}-${++ctagsInputCount}${path.extname(this.doc.fileName)}`
+    )
+    await fs.promises.writeFile(input, maskMacroCalls(this.doc.getText()))
     let args: string[] =
       '-f - --fields=+K --sort=no --excmd=n --fields-SystemVerilog=+{parameter}'.split(' ')
-    args.push(filepath)
+    args.push(input)
     // this.logger.info('executing ctags: ' + command + ' ' + args.join(' '))
     return new Promise((resolve, _reject) => {
       child_process.execFile(
@@ -137,6 +189,7 @@ export class VerilogDoc {
         args,
         { encoding: 'utf-8' },
         (_error, stdout: string, _stderr: string) => {
+          fs.promises.unlink(input).catch(() => {})
           resolve(stdout)
         }
       )
@@ -151,6 +204,10 @@ export class VerilogDoc {
       let lineNo: number
       let parts: string[] = line.split('\t')
       name = parts[0]
+      if (name === '_') {
+        // placeholder from maskMacroCalls
+        return undefined
+      }
       type = parts[3]
       // override "type" for parameters (See #102)
       if (parts.length === 6) {
@@ -282,16 +339,18 @@ export class VerilogDoc {
   async getNestedHoverText(sym: Symbol): Promise<Array<string>> {
     let ret: string[] = []
     ret.push(sym.getHoverText())
-    if (!(sym.type in ['port', 'parameter'])) {
+    if (!['port', 'parameter', 'constant', 'net', 'register'].includes(sym.type)) {
       return ret
     }
     // find other words with definitions in the hover text, and add them
-    let range = sym.getFullRange()
-    let words = new Set(this.doc.getText(range).match(/\b[a-zA-Z_]\w*\b/g) || [])
+    let words = new Set(sym.getHoverText().match(/\b[a-zA-Z_]\w*\b/g) || [])
     words.delete(sym.name)
 
-    let docsyms = await this.getSymbols()
-    let syms = docsyms.filter((sym) => words.has(sym.name))
+    const unit = sym.parentScope.split('.')[0]
+    let syms: Symbol[] = []
+    for (const word of words) {
+      syms.push(...(await this.findVisible(word, unit)))
+    }
     let defs = await Promise.all(
       syms.map(async (s: Symbol) => {
         return s.getHoverText()
@@ -303,6 +362,39 @@ export class VerilogDoc {
     }
 
     return ret
+  }
+
+  /// Symbols named `name` as seen from top level unit `unit` (a module, interface or package
+  /// of this file): those in the unit first, then the rest of the file, then imported packages.
+  async findVisible(name: string, unit: string | undefined): Promise<Symbol[]> {
+    const all = await this.getSymbols({ name })
+    const own = all.filter((sym) => sym.doc === this.doc)
+    const inUnit = own.filter(
+      (sym) =>
+        unit !== undefined &&
+        (sym.parentScope === unit || sym.parentScope.startsWith(unit + '.') || sym.name === unit)
+    )
+    if (inUnit.length > 0) {
+      return inUnit
+    }
+    if (own.length > 0) {
+      return own
+    }
+    // imports of imports can bring a package in twice
+    const seen = new Set<string>()
+    return all.filter((sym) => {
+      const key = sym.doc.uri.toString() + ':' + sym.line
+      if (seen.has(key)) {
+        return false
+      }
+      seen.add(key)
+      return true
+    })
+  }
+
+  /// name of the top level unit of this file containing `position`
+  unitAt(position: vscode.Position): string | undefined {
+    return this.topSymbols.find((sym) => sym.isValid && sym.getFullRange().contains(position))?.name
   }
 
   async getPortHints(

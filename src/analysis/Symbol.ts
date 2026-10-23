@@ -203,7 +203,8 @@ export class Symbol {
 
     let code = this.doc
       .lineAt(this.line)
-      .text.trim()
+      .text.replace(/\/\/.*$/, '') // the comment is shown separately, see getDocComment
+      .trim()
       .replace(/\s{2,}/g, ' ') // trim long whitespace from formatting
       .replace(/,$/, '') // remove trailing commas
       .replace(/#\($/, '') // remove trailing #(
@@ -211,11 +212,43 @@ export class Symbol {
     return code
   }
 
+  /// Comment lines directly above the declaration, plus the trailing // comment on its line
+  /// for symbols whose hover text drops it
+  getDocComment(): string {
+    const lines: string[] = []
+    let line = this.line - 1
+    if (line >= 0 && this.doc.lineAt(line).text.trim().endsWith('*/')) {
+      // /* ... */ block
+      while (line >= 0) {
+        const text = this.doc.lineAt(line).text.trim()
+        lines.unshift(text.replace(/^\/\*+|\*+\/$/g, '').replace(/^\*\s?/, ''))
+        if (text.startsWith('/*')) {
+          break
+        }
+        line--
+      }
+    } else {
+      for (; line >= 0; line--) {
+        const text = this.doc.lineAt(line).text.trim()
+        if (!text.startsWith('//')) {
+          break
+        }
+        lines.unshift(text.replace(/^\/\/+\s?/, ''))
+      }
+    }
+    const multiline = this.type === 'typedef' || this.type === 'instance' || this.isMacro()
+    const trailing = this.doc.lineAt(this.line).text.match(/\/\/+\s?(.*)$/)
+    if (!multiline && trailing !== null && trailing[1].trim() !== '') {
+      lines.push(trailing[1].trim())
+    }
+    return lines.join('\n').trim()
+  }
+
   getDefinitionLink(): vscode.DefinitionLink {
     return {
       targetUri: this.doc.uri,
-      targetRange: this.getIdRange(),
-      targetSelectionRange: this.fullRange,
+      targetRange: this.getFullRange(),
+      targetSelectionRange: this.getIdRange(),
     }
   }
 

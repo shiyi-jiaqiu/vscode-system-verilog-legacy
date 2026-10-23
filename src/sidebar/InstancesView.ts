@@ -147,6 +147,7 @@ export class InstancesView
   constructor() {
     super({
       name: 'Instances',
+      when: '!verilog.slangExtensionActive',
       welcome: {
         contents: '[Select top level](command:verilog.project.selectTopLevel)',
       },
