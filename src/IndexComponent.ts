@@ -2,7 +2,7 @@
 import * as child_process from 'child_process'
 import * as vscode from 'vscode'
 import { Symbol } from './analysis/Symbol'
-import { VerilogDoc } from './analysis/VerilogDoc'
+import { CTAGS_MAPS, VerilogDoc } from './analysis/VerilogDoc'
 import { ext } from './extension'
 import { ConfigObject, ExtensionComponent } from './lib/libconfig'
 import { getParentText, getPrevChar, isAnyVerilog } from './utils'
@@ -170,7 +170,7 @@ export class IndexComponent extends ExtensionComponent {
     const stdout = await new Promise<string>((resolve) => {
       const proc = child_process.execFile(
         command,
-        args.split(' '),
+        args.split(' ').concat(CTAGS_MAPS),
         { encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024 },
         (error, out) => {
           if (error !== null) {

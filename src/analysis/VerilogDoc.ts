@@ -65,6 +65,9 @@ function maskMacroCalls(text: string): string {
 
 let ctagsInputCount = 0
 
+/// Universal Ctags releases up to 6.2.1 map only *.v to Verilog, so .vh headers were not parsed
+export const CTAGS_MAPS = ['--map-Verilog=+.vh', '--map-Verilog=+.vl']
+
 class VerilogPortHint extends vscode.InlayHint {
   implicit: boolean
 
@@ -181,6 +184,7 @@ export class VerilogDoc {
     await fs.promises.writeFile(input, maskMacroCalls(this.doc.getText()))
     let args: string[] =
       '-f - --fields=+K --sort=no --excmd=n --fields-SystemVerilog=+{parameter}'.split(' ')
+    args.push(...CTAGS_MAPS)
     args.push(input)
     // this.logger.info('executing ctags: ' + command + ' ' + args.join(' '))
     return new Promise((resolve, _reject) => {

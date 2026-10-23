@@ -123,7 +123,11 @@ class VeribleVerilogFormatEditProvider
       return []
     }
 
-    let args = this.args.getValue().split(' ')
+    // an empty setting must not become an empty file argument
+    let args = this.args
+      .getValue()
+      .split(' ')
+      .filter((arg) => arg !== '')
     args.push('-')
 
     this.logger.info('Executing command: ' + binPath + ' ' + args.join(' '))
