@@ -13,14 +13,14 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.2.0.vsix
+code --install-extension verilog-systemverilog-legacy-0.2.1.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), and for linting [slang](https://github.com/MikePopoloski/slang) (or another linter supported upstream).
 
 ## Configure
 
-For a single-folder workspace, `scripts/hdl-setup` (Python 3) writes an initial `.vscode/hdl.f` from the `.v`, `.vl` and `.sv` files and include directories it finds, and sets the extension's settings while keeping unrelated ones. Slang arguments go after `--`:
+For a single-folder workspace, `scripts/hdl-setup` (Python 2.7 or 3) writes an initial `.vscode/hdl.f` and sets the extension's settings while keeping unrelated ones. The filelist lists the `.v`, `.vl` and `.sv` files with packages first, leaves out files that other files `` `include ``, and adds the `-I` directories those `` `include `` lines need; includes it cannot find in the workspace are printed. Slang arguments go after `--`:
 
 ```sh
 scripts/hdl-setup /path/to/workspace -- --top my_top -Wextra

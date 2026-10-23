@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """Create an initial HDL filelist and configure a single-folder VS Code workspace."""
 
+# Runs on Python 2.7 as well, the only Python of a stock CentOS 7.
+from __future__ import print_function
+
 import argparse
+import io
 import json
 import os
+import re
 import sys
-from pathlib import Path
 
 
 SOURCE_SUFFIXES = {".v", ".vl", ".sv"}
 HEADER_SUFFIXES = {".vh", ".svh"}
 FILELIST = ".vscode/hdl.f"
+INCLUDE_RE = re.compile(r'^[ \t]*`include[ \t]+"([^"]+)"', re.M)
+PACKAGE_RE = re.compile(r"^[ \t]*package[ \t]+\w+", re.M)
+
+
+def read_text(path):
+    with io.open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def write_text(path, text):
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write(text if isinstance(text, type(u"")) else text.decode("utf-8"))
 
 
 def tokens(text):
@@ -105,43 +121,76 @@ def quoted_path(path):
 
 
 def make_filelist(root):
+    """Lists the sources, with the include directories their `include lines need.
+
+    A file named by an `include is not listed as a source, whatever its suffix, since
+    compiling it on its own repeats or breaks its contents. Packages come first, as
+    some tools need a package compiled before its users.
+    """
+    texts = {}
     sources = []
-    includes = set()
     for directory, subdirs, names in os.walk(root):
         subdirs[:] = sorted(name for name in subdirs if name not in (".git", ".vscode"))
-        for name in names:
-            path = Path(directory, name)
-            relative = path.relative_to(root).as_posix()
-            if path.suffix.lower() in SOURCE_SUFFIXES:
-                sources.append(quoted_path(relative))
-            elif path.suffix.lower() in HEADER_SUFFIXES:
-                includes.add(quoted_path(path.parent.relative_to(root).as_posix()))
+        for name in sorted(names):
+            path = os.path.join(directory, name)
+            suffix = os.path.splitext(name)[1].lower()
+            if suffix in SOURCE_SUFFIXES or suffix in HEADER_SUFFIXES:
+                texts[path] = read_text(path)
+                if suffix in SOURCE_SUFFIXES:
+                    sources.append(path)
     if not sources:
-        raise ValueError("no .v, .vl or .sv source files found in " + str(root))
+        raise ValueError("no .v, .vl or .sv source files found in " + root)
+
+    included = set()
+    incdirs = set()
+    unresolved = set()
+    for path in sorted(texts):
+        for name in INCLUDE_RE.findall(texts[path]):
+            sibling = os.path.normpath(os.path.join(os.path.dirname(path), name))
+            if sibling in texts:
+                found = [(sibling, os.path.dirname(path))]
+            else:
+                # `include "common/regs.svh" needs the directory above common/
+                suffix = os.sep + os.path.normpath(name)
+                found = [(f, f[: -len(suffix)]) for f in texts if f.endswith(suffix)]
+            if not found:
+                unresolved.add(name)
+            for header, incdir in found:
+                included.add(header)
+                incdirs.add(incdir)
+
+    sources = [path for path in sources if path not in included]
+    sources.sort(key=lambda path: (PACKAGE_RE.search(texts[path]) is None, path))
+
+    def relative(path):
+        return quoted_path(os.path.relpath(path, root).replace(os.sep, "/"))
+
     lines = ["# Initial HDL inventory; edit source selection, include paths and macros as needed."]
-    lines += ["-I " + item for item in sorted(includes)]
-    lines += sorted(sources)
+    lines += ["-I " + relative(item) for item in sorted(incdirs)]
+    lines += [relative(item) for item in sources]
+    if unresolved:
+        print("Includes not found in the workspace: " + ", ".join(sorted(unresolved)))
     return "\n".join(lines) + "\n", len(sources)
 
 
 def main(argv):
     parser = argparse.ArgumentParser(description="Set up a single-folder HDL workspace")
-    parser.add_argument("workspace", type=Path)
+    parser.add_argument("workspace")
     split = argv.index("--") if "--" in argv else len(argv)
     before = argv[:split]
     lint_args = argv[split + 1:] if split < len(argv) else None
     args = parser.parse_args(before)
-    root = args.workspace.resolve()
-    if not root.is_dir():
-        parser.error("workspace is not a directory: " + str(root))
+    root = os.path.realpath(args.workspace)
+    if not os.path.isdir(root):
+        parser.error("workspace is not a directory: " + root)
 
-    settings_path = root / ".vscode/settings.json"
-    filelist_path = root / FILELIST
+    settings_path = os.path.join(root, ".vscode", "settings.json")
+    filelist_path = os.path.join(root, FILELIST)
     filelist = None
     count = None
-    if filelist_path.exists() and not filelist_path.is_file():
-        raise ValueError("filelist path is not a file: " + str(filelist_path))
-    if not filelist_path.exists():
+    if os.path.exists(filelist_path) and not os.path.isfile(filelist_path):
+        raise ValueError("filelist path is not a file: " + filelist_path)
+    if not os.path.exists(filelist_path):
         filelist, count = make_filelist(root)
     values = {
         "verilog.filelist": FILELIST,
@@ -151,18 +200,20 @@ def main(argv):
     }
     if lint_args is not None:
         values["verilog.lint.slang.args"] = " ".join(lint_args)
-    existing = settings_path.read_text() if settings_path.exists() else "{}\n"
+    exists = os.path.exists(settings_path)
+    existing = read_text(settings_path) if exists else u"{}\n"
     settings = update_settings(existing, values)
 
-    settings_path.parent.mkdir(exist_ok=True)
+    if not os.path.isdir(os.path.dirname(settings_path)):
+        os.mkdir(os.path.dirname(settings_path))
     if filelist is not None:
-        filelist_path.write_text(filelist)
-        print("Created " + str(filelist_path) + " with " + str(count) + " source files")
+        write_text(filelist_path, filelist)
+        print("Created " + filelist_path + " with " + str(count) + " source files")
     else:
-        print("Kept existing " + str(filelist_path))
-    if settings != existing or not settings_path.exists():
-        settings_path.write_text(settings)
-    print("Configured " + str(settings_path))
+        print("Kept existing " + filelist_path)
+    if settings != existing or not exists:
+        write_text(settings_path, settings)
+    print("Configured " + settings_path)
     print("Review the filelist, then run 'Verilog: Reindex' in VS Code.")
 
 
