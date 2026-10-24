@@ -102,27 +102,34 @@ export class SemanticTokensComponent
         global.set(sym.name, sym)
       }
     }
-    // top level units with their symbols
+    // symbols by the top level unit they are in
+    const unitNames = new Map<string, Map<string, Symbol>>()
+    for (const sym of own) {
+      const unit = sym.parentScope.split('.')[0]
+      const names = unitNames.get(unit) ?? new Map<string, Symbol>()
+      unitNames.set(unit, names)
+      if (!names.has(sym.name)) {
+        names.set(sym.name, sym)
+      }
+    }
+    // in text order, so the unit and instance around an identifier are found by moving forward
     const units = vdoc.topSymbols
       .filter((sym) => sym.isValid)
       .map((unit) => {
-        const names = new Map<string, Symbol>()
-        for (const sym of own) {
-          if (sym.parentScope === unit.name || sym.parentScope.startsWith(unit.name + '.')) {
-            if (!names.has(sym.name)) {
-              names.set(sym.name, sym)
-            }
-          }
-        }
         const range = unit.getFullRange()
+        const names = unitNames.get(unit.name) ?? new Map<string, Symbol>()
         return { start: document.offsetAt(range.start), end: document.offsetAt(range.end), names }
       })
+      .sort((a, b) => a.start - b.start)
     const instances = own
       .filter((sym) => sym.type === 'instance' && sym.typeRef !== null)
       .map((inst) => {
         const range = inst.getFullRange()
         return { start: document.offsetAt(range.start), end: document.offsetAt(range.end), inst }
       })
+      .sort((a, b) => a.start - b.start)
+    let unitAt = 0
+    let instAt = 0
     // direct members of another module or package
     const memberCache = new Map<string, Promise<Map<string, Symbol>>>()
     const members = (unit: string) => {
@@ -172,7 +179,11 @@ export class SemanticTokensComponent
       }
       if (text[offset - 1] === '.') {
         // named port or parameter connection of an instance
-        const inst = instances.find((i) => i.start <= offset && offset < i.end)?.inst
+        while (instAt < instances.length && instances[instAt].end <= offset) {
+          instAt++
+        }
+        const around = instances.at(instAt)
+        const inst = around !== undefined && around.start <= offset ? around.inst : undefined
         if (inst !== undefined) {
           const ports = await members(inst.typeRef!)
           const sym = ports.get(name)
@@ -180,7 +191,11 @@ export class SemanticTokensComponent
         }
         continue
       }
-      const unit = units.find((u) => u.start <= offset && offset <= u.end)
+      while (unitAt < units.length && units[unitAt].end < offset) {
+        unitAt++
+      }
+      const nearUnit = units.at(unitAt)
+      const unit = nearUnit !== undefined && nearUnit.start <= offset ? nearUnit : undefined
       const sym = unit?.names.get(name) ?? global.get(name)
       push(offset, name.length, sym ? symbolToken(sym) : unitToken(ext.index.unitKinds.get(name)))
     }

@@ -1,17 +1,56 @@
 // SPDX-License-Identifier: MIT
 import * as vscode from 'vscode'
 import { ext } from '../extension'
-import { InlayPorts } from '../InlayHintsComponent'
-import { ExtensionComponent, ConfigObject, PathConfigObject } from '../lib/libconfig'
-import { anyVerilogSelector, getParentText, getPrev2Char, getPrevChar } from '../utils'
+import { resolveInclude } from '../Filelist'
+import { ExtensionComponent, PathConfigObject } from '../lib/libconfig'
+import {
+  anyVerilogSelector,
+  getParentText,
+  getPrev2Char,
+  getPrevChar,
+  getWorkspaceFolder,
+} from '../utils'
 import builtins from './builtins.json'
 import { getConstValue, getMacroBody } from './ConstValue'
-import { Symbol } from './Symbol'
+import { Symbol, SymbolCompletionItem } from './Symbol'
+
+/// Completion of the `define of `name` on line `ln`, with a placeholder for each argument
+function macroCompletionItem(name: string, kind: string, ln: string): vscode.CompletionItem {
+  let args = ln.substring(ln.indexOf('(') + 1, ln.indexOf(')'))
+
+  let snip = new vscode.SnippetString(name + '(')
+  let arglist = args.split(',')
+  for (let i = 0; i < arglist.length; i++) {
+    snip.appendPlaceholder(arglist[i].trim())
+    if (i !== arglist.length - 1) {
+      snip.appendText(', ')
+    }
+  }
+  snip.appendText(')')
+  let txt = ln.substring(ln.indexOf(name), ln.indexOf(')') + 1)
+  let item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Snippet)
+  item.detail = kind
+  item.filterText = name
+  item.insertText = snip
+  item.documentation = txt
+  item.label = '`' + item.label
+  return item
+}
 
 /// right hand side of `name = value` hover text, to skip repeating a literal value
 function getValueText(hover: string): string {
   return hover.replace(/;\s*$/, '').split('=').slice(1).join('=').trim()
 }
+
+// comments, strings, based numbers, system tasks and escaped identifiers are skipped;
+// group 1: identifier or `macro
+const TOKEN_RE =
+  /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\\n])*"|'[sS]?[bodhBODH]\s*[\w?]+|\$\w+|\\\S+|(`?[A-Za-z_][\w$]*)/g
+const MACRO_DIRECTIVES = new Set(['`define', '`undef', '`ifdef', '`ifndef', '`elsif'])
+/// what comes just before the target of an assignment
+const STATEMENT_START = new Set([';', ')', ':', 'begin', 'else', 'assign', 'force', 'release'])
+/// `name[i].f <=` or `name =`, but not `name ==`
+const ASSIGNED_RE = /^(?:\s*(?:\[[^\]]*\]|\.\w+))*\s*<?=(?!=)/
 
 export class CtagsServerComponent
   extends ExtensionComponent
@@ -19,6 +58,7 @@ export class CtagsServerComponent
     vscode.CompletionItemProvider,
     vscode.DocumentSymbolProvider,
     vscode.DefinitionProvider,
+    vscode.DocumentHighlightProvider,
     vscode.HoverProvider,
     vscode.InlayHintsProvider
 {
@@ -33,21 +73,12 @@ export class CtagsServerComponent
     }
   )
 
-  indexAllIncludes: ConfigObject<boolean> = new ConfigObject({
-    default: false,
-    description: '(Deprecated) Use `verilog.index.IndexAllIncludes` instead',
-  })
-
   builtinsPath: string | undefined
   builtinCompletions: Map<string, vscode.CompletionItem> = new Map()
   builtinHovers: Map<string, vscode.Hover> = new Map()
 
   async activate(context: vscode.ExtensionContext) {
     // push provider subs to .v and .sv files
-    if (!ext.ctagsEnabled()) {
-      this.logger.info('Ctags indexing disabled, skipping registration')
-      return
-    }
     if (ext.slangExtensionActive()) {
       this.logger.info('vscode-slang is active, skipping ctags providers')
       return
@@ -75,6 +106,10 @@ export class CtagsServerComponent
 
     context.subscriptions.push(
       vscode.languages.registerDefinitionProvider(anyVerilogSelector, this)
+    )
+
+    context.subscriptions.push(
+      vscode.languages.registerDocumentHighlightProvider(anyVerilogSelector, this)
     )
 
     context.subscriptions.push(
@@ -201,13 +236,9 @@ export class CtagsServerComponent
 
     // Macro Completion
     if (context.triggerCharacter === '`') {
-      let macroCompletions = []
-      for (let symbols of ext.index.symbolMap.values()) {
-        const completion = symbols[0].getMacroCompletionItem()
-        if (completion) {
-          macroCompletions.push(completion)
-        }
-      }
+      const macroCompletions = Array.from(ext.index.headerMacros, ([name, [kind, line]]) =>
+        macroCompletionItem(name, kind, line)
+      )
       this.logger.info(`Returning ${macroCompletions.length} macro completions`)
       return macroCompletions
     }
@@ -292,6 +323,13 @@ export class CtagsServerComponent
     return items
   }
 
+  resolveCompletionItem(item: vscode.CompletionItem): vscode.CompletionItem {
+    if (item instanceof SymbolCompletionItem) {
+      item.resolve()
+    }
+    return item
+  }
+
   ////////////////////////////////////////////////
   // Hover Provider
   ////////////////////////////////////////////////
@@ -373,34 +411,19 @@ export class CtagsServerComponent
   ////////////////////////////////////////////////
   // Inlay Hints Provider
   ////////////////////////////////////////////////
-  onDidChangeInlayHintsEmitter: vscode.EventEmitter<void> = new vscode.EventEmitter<void>()
-  readonly onDidChangeInlayHints: vscode.Event<void> = this.onDidChangeInlayHintsEmitter.event
-
   async provideInlayHints(
     document: vscode.TextDocument,
     range: vscode.Range,
     _token: vscode.CancellationToken
   ): Promise<vscode.InlayHint[]> {
-    const wildcardPorts = ext.inlayHints.wildcardPorts.getValue() === 'on'
-    const ports = ext.inlayHints.ports.getValue()
-    if (!wildcardPorts && ports === InlayPorts.OFF) {
-      return []
-    }
-    let hints = []
-    // get module insts in range with a typeRef
     const verilogDoc = ext.index.getVerilogDoc(document)
-    let insts = await verilogDoc.getSymbols({ type: 'instance' })
-    insts = insts.filter((inst) => inst.getFullRange().intersection(range) !== undefined)
-    insts = insts.filter((inst) => inst.typeRef !== null)
-    const hintPromises = insts.map(async (inst) => {
-      return await verilogDoc.getPortHints(inst, wildcardPorts, ports)
-    })
-    this.logger.info(`provideInlayHints() => Found ${insts.length} module instances`)
-    for (let hintPromise of hintPromises) {
-      const instHints = await hintPromise
-      if (instHints !== undefined) {
-        hints.push(...instHints)
-      }
+    const insts = (await verilogDoc.getSymbols({ type: 'instance' })).filter(
+      (inst) => inst.typeRef !== null && inst.getFullRange().intersection(range) !== undefined
+    )
+    // one at a time: each may open and index the file of its module
+    const hints: vscode.InlayHint[] = []
+    for (const inst of insts) {
+      hints.push(...(await verilogDoc.getPortHints(inst)))
     }
     return hints
   }
@@ -420,7 +443,12 @@ export class CtagsServerComponent
         continue
       }
 
-      let resolvedPath = await ext.includes.resolve(document, match[2])
+      let resolvedPath = await resolveInclude(
+        document.fileName,
+        match[2],
+        ext.projectFilelist,
+        getWorkspaceFolder()
+      )
       if (!resolvedPath) {
         continue
       }
@@ -483,5 +511,69 @@ export class CtagsServerComponent
       this.logger.error(`provideDocumentSymbols(${document.uri}) => ${e}`)
       return []
     }
+  }
+
+  ////////////////////////////////////////////////
+  // Document Highlight Provider
+  ////////////////////////////////////////////////
+
+  /// Uses of the identifier at `position` in its module (in the whole file for a `macro or
+  /// outside modules), without those in comments and strings. Declarations and assignments are
+  /// writes. F7 and Shift+F7 move between them.
+  async provideDocumentHighlights(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    _token: vscode.CancellationToken
+  ): Promise<vscode.DocumentHighlight[]> {
+    const range = document.getWordRangeAtPosition(position)
+    if (range === undefined) {
+      return []
+    }
+    const name = document.getText(range)
+    const macro = getPrevChar(document, range.start) === '`'
+    const target = (macro ? '`' : '') + name
+    const vdoc = ext.index.getVerilogDoc(document)
+    const declared = new Set((await vdoc.getSymbols({ name }, false)).map((sym) => sym.line))
+    const unit = macro
+      ? undefined
+      : vdoc.topSymbols.find((sym) => sym.isValid && sym.getFullRange().contains(position))
+    const text = document.getText()
+    const end = unit === undefined ? text.length : document.offsetAt(unit.getFullRange().end)
+
+    const highlights: vscode.DocumentHighlight[] = []
+    let last = unit === undefined ? 0 : document.offsetAt(unit.getFullRange().start)
+    let prev = ''
+    let match: RegExpExecArray | null
+    TOKEN_RE.lastIndex = last
+    while ((match = TOKEN_RE.exec(text)) !== null && match.index < end) {
+      const gap = text.slice(last, match.index).trim()
+      last = TOKEN_RE.lastIndex
+      if (gap !== '') {
+        prev = gap.endsWith('::') ? '::' : gap[gap.length - 1]
+      }
+      const word = match[1]
+      if (word === undefined) {
+        continue
+      }
+      const used =
+        word === target
+          ? macro || (prev !== '.' && prev !== '::')
+          : macro && word === name && MACRO_DIRECTIVES.has(prev)
+      if (used) {
+        const start = document.positionAt(match.index)
+        const write =
+          declared.has(start.line) ||
+          (STATEMENT_START.has(prev) && ASSIGNED_RE.test(text.slice(last, last + 200)))
+        highlights.push(
+          new vscode.DocumentHighlight(
+            new vscode.Range(start, document.positionAt(last)),
+            write ? vscode.DocumentHighlightKind.Write : vscode.DocumentHighlightKind.Read
+          )
+        )
+      }
+      prev = word
+    }
+    // nothing for a word in a comment or string
+    return highlights.some((h) => h.range.contains(position)) ? highlights : []
   }
 }

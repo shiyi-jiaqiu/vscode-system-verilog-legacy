@@ -1,13 +1,6 @@
 import { ConfigObject, ExtensionComponent, PathConfigObject } from './libconfig'
 
-export class Runner extends ExtensionComponent {
-  runAtFileLocation: ConfigObject<boolean> = new ConfigObject({
-    default: false,
-    description: 'Run at file location',
-  })
-}
-
-export class ToolConfig extends Runner {
+export class ToolConfig extends ExtensionComponent {
   path: PathConfigObject
   args: ConfigObject<string> = new ConfigObject({
     default: '',
@@ -28,11 +21,4 @@ export class ToolConfig extends Runner {
       }
     )
   }
-}
-
-export class ToggleToolConfig extends ToolConfig {
-  enabled: ConfigObject<boolean> = new ConfigObject({
-    default: false,
-    description: 'Enable this tool',
-  })
 }

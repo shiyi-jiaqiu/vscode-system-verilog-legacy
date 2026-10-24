@@ -52,3 +52,26 @@ export function readFilelist(file: string, root: string): Filelist {
   }
   return result
 }
+
+/// The file that `` `include "name" `` in `includer` reads: found in the include directories of
+/// the filelist, then the workspace root, then the directory of `includer`.
+export async function resolveInclude(
+  includer: string,
+  name: string,
+  filelist: Filelist | undefined,
+  root: string | undefined
+): Promise<string | undefined> {
+  const dirs = path.isAbsolute(name)
+    ? ['']
+    : (filelist?.incdirs ?? []).concat(root ?? [], path.dirname(includer))
+  for (const dir of dirs) {
+    const file = path.join(dir, name)
+    try {
+      await fs.promises.access(file)
+      return file
+    } catch {
+      // not in this directory
+    }
+  }
+  return undefined
+}

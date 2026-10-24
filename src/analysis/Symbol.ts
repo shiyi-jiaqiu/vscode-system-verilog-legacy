@@ -1,6 +1,24 @@
 import * as vscode from 'vscode'
 import { VerilogDoc } from './VerilogDoc'
 
+/// A completion item whose documentation is made when the editor shows it
+export class SymbolCompletionItem extends vscode.CompletionItem {
+  constructor(readonly symbol: Symbol) {
+    super(
+      { label: symbol.name, detail: ' ' + symbol.getTypeInfo() },
+      symbol.getCompletionItemKind()
+    )
+  }
+
+  resolve() {
+    if (this.symbol.type !== 'instance') {
+      const md = new vscode.MarkdownString()
+      md.appendCodeblock(this.symbol.getHoverText(), 'systemverilog')
+      this.documentation = md
+    }
+  }
+}
+
 export class Symbol {
   name: string
   type: string
@@ -363,19 +381,7 @@ export class Symbol {
   }
 
   public getCompletionItem(): vscode.CompletionItem {
-    let item: vscode.CompletionItem = new vscode.CompletionItem(
-      {
-        label: this.name,
-        detail: ' ' + this.getTypeInfo(),
-      },
-      this.getCompletionItemKind()
-    )
-    if (!(this.type === 'instance')) {
-      let md = new vscode.MarkdownString()
-      md.appendCodeblock(this.getHoverText(), 'systemverilog')
-      item.documentation = md
-    }
-    return item
+    return new SymbolCompletionItem(this)
   }
 
   public getTypeInfo(): string {
@@ -408,32 +414,6 @@ export class Symbol {
       return 'typedef ' + assign
     }
     return this.typeRef ?? this.type
-  }
-
-  public getMacroCompletionItem(): vscode.CompletionItem | undefined {
-    if (!this.isMacro()) {
-      return undefined
-    }
-    let ln = this.doc.lineAt(this.line).text
-    let args = ln.substring(ln.indexOf('(') + 1, ln.indexOf(')'))
-
-    let snip = new vscode.SnippetString(this.name + '(')
-    let arglist = args.split(',')
-    for (let i = 0; i < arglist.length; i++) {
-      snip.appendPlaceholder(arglist[i].trim())
-      if (i !== arglist.length - 1) {
-        snip.appendText(', ')
-      }
-    }
-    snip.appendText(')')
-    let txt = ln.substring(this.getIdRange().start.character, ln.indexOf(')') + 1)
-    let item = new vscode.CompletionItem(this.name, vscode.CompletionItemKind.Snippet)
-    item.detail = this.type
-    item.filterText = this.name
-    item.insertText = snip
-    item.documentation = txt
-    item.label = '`' + item.label
-    return item
   }
 
   public getCompletionItemKind(): vscode.CompletionItemKind {

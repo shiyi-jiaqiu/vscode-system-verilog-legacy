@@ -5,10 +5,6 @@ export function getWorkspaceFolder(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? undefined
 }
 
-export function getWorkspaceUri(): vscode.Uri | undefined {
-  return vscode.workspace.workspaceFolders?.[0]?.uri
-}
-
 export function getPrevChar(
   document: vscode.TextDocument,
   start: vscode.Position
@@ -74,31 +70,6 @@ export function raceArrays<T>(promises: Array<Promise<Array<T>>>): Promise<Array
   return Promise.race(promises.map(filterPromise))
 }
 
-// wspath -> abs path
-export function getAbsPath(inputPath: string): string {
-  if (path.isAbsolute(inputPath)) {
-    return inputPath
-  }
-  let wspath = getWorkspaceFolder()
-  if (wspath === undefined) {
-    return inputPath
-  }
-  return path.join(wspath, inputPath)
-}
-
-export class FileDiagnostic extends vscode.Diagnostic {
-  file: string
-  constructor(
-    file: string,
-    range: vscode.Range,
-    message: string,
-    severity?: vscode.DiagnosticSeverity
-  ) {
-    super(range, message, severity)
-    this.file = file
-  }
-}
-
 export const VerilogLanguages = ['verilog', 'verilogheader']
 export const SystemVerilogLanguages = ['systemverilog', 'systemverilogheader']
 export const AnyVerilogLanguages = [
@@ -111,11 +82,6 @@ export const AnyVerilogLanguages = [
 export const verilogSelector = [
   { scheme: 'file', language: 'verilog' },
   { scheme: 'file', language: 'verilogheader' },
-]
-
-export const systemverilogSelector = [
-  { scheme: 'file', language: 'systemverilog' },
-  { scheme: 'file', language: 'systemverilogheader' },
 ]
 
 export const anyVerilogSelector = [

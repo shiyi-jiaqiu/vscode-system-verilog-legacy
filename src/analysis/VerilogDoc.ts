@@ -4,7 +4,6 @@ import * as os from 'os'
 import * as path from 'path'
 import * as vscode from 'vscode'
 import { ext } from '../extension'
-import { InlayPorts } from '../InlayHintsComponent'
 import { Logger } from '../lib/logger'
 import { Symbol } from './Symbol'
 // select one
@@ -33,7 +32,7 @@ const DIRECTIVES = new Set([
 /// drop the rest of that list. Blank out macro calls (keeping newlines, so line numbers
 /// still match). A call used as a declared name, `` `NAME(x) = 0 ``, becomes `_` so the
 /// declaration keeps its own name instead of taking the type's.
-function maskMacroCalls(text: string): string {
+export function maskMacroCalls(text: string): string {
   const blank = (s: string) => s.replace(/[^\n]/g, ' ')
   const callRe = /`([A-Za-z_]\w*)/g
   let out = ''
@@ -68,20 +67,6 @@ let ctagsInputCount = 0
 /// Universal Ctags releases up to 6.2.1 map only *.v to Verilog, so .vh headers were not parsed
 export const CTAGS_MAPS = ['--map-Verilog=+.vh', '--map-Verilog=+.vl']
 
-class VerilogPortHint extends vscode.InlayHint {
-  implicit: boolean
-
-  constructor(
-    position: vscode.Position,
-    label: string,
-    kind: vscode.InlayHintKind,
-    implicit: boolean
-  ) {
-    super(position, label, kind)
-    this.implicit = implicit
-  }
-}
-
 // TODO: add a user setting to enable/disable all ctags based operations
 export class VerilogDoc {
   /// Symbol definitions (no rhs)
@@ -90,7 +75,6 @@ export class VerilogDoc {
   symbols: Symbol[]
   importSymbols: Symbol[] | undefined
   topSymbols: Symbol[]
-  hoverSet: Set<string> = new Set()
   private logger: Logger
 
   constructor(logger: Logger, document: vscode.TextDocument) {
@@ -100,7 +84,6 @@ export class VerilogDoc {
     this.isDirty = true
     this.logger = logger
     this.doc = document
-    ext.ctags.path.listen()
   }
 
   clearSymbols() {
@@ -270,6 +253,9 @@ export class VerilogDoc {
           let match: RegExpExecArray | null = null
           let endPosition: vscode.Position
           let text = this.doc.getText()
+          const starts = this.symbols.slice().sort((a, b) => a.line - b.line)
+          const open = new Map<string, Symbol[]>()
+          let next = 0
           let eRegex: RegExp = /^(?![\r\n])\s*end(\w*)*[\s:]?/gm
           while ((match = eRegex.exec(text))) {
             if (match === null) {
@@ -280,22 +266,18 @@ export class VerilogDoc {
             }
 
             endPosition = this.doc.positionAt(match.index + match[0].length - 1)
-            let type: string = match[1]
-            // get the starting symbols of the same type
-            // doesn't check for begin...end blocks
-            let s = this.symbols.filter((sym) => {
-              return sym.type === type && sym.startPosition.isBefore(endPosition) && !sym.isValid
-            })
-            if (s.length === 0) {
-              continue
+            // symbols that start before this end tag are waiting for theirs, by type
+            while (next < starts.length && starts[next].startPosition.isBefore(endPosition)) {
+              const sym = starts[next++]
+              const waiting = open.get(sym.type)
+              if (waiting === undefined) {
+                open.set(sym.type, [sym])
+              } else {
+                waiting.push(sym)
+              }
             }
-            // get the symbol nearest to the end tag
-            let max: Symbol = s.reduce(
-              (max, current) =>
-                current.getIdRange().start.isAfter(max.startPosition) ? current : max,
-              s[0]
-            )
-            max.setEndPosition(endPosition.line)
+            // the nearest unclosed symbol of the same type; doesn't check for begin...end blocks
+            open.get(match[1])?.pop()?.setEndPosition(endPosition.line)
           }
         }
 
@@ -401,103 +383,33 @@ export class VerilogDoc {
     return this.topSymbols.find((sym) => sym.isValid && sym.getFullRange().contains(position))?.name
   }
 
-  async getPortHints(
-    inst: Symbol,
-    wildcardPorts: boolean,
-    normalPorts: InlayPorts
-  ): Promise<VerilogPortHint[] | undefined> {
-    // can only operate on insts
+  /// For an instance connected with `.*`, a hint after it listing the ports of its module
+  async getPortHints(inst: Symbol): Promise<vscode.InlayHint[]> {
     if (inst.type !== 'instance' || inst.typeRef === null) {
-      return undefined
+      return []
     }
-
-    // get ports from this inst's module definition
+    const fullRange = inst.getFullRange()
+    const instText = this.doc.getText(fullRange)
+    const dotStar = instText.indexOf('.*', instText.indexOf(inst.name))
+    if (dotStar === -1) {
+      return []
+    }
     const module = await ext.index.findModule(inst.typeRef)
     if (module === undefined) {
-      return undefined
+      return []
     }
-    let ports: Symbol[] = await module.getSymbols({ type: 'port' }, false)
-    ports = ports.filter((port) => port.parentScope === inst.typeRef)
-    const portMap = new Map<string, Symbol>()
-    ports.forEach((port) => {
-      portMap.set(port.name, port)
-    })
-
-    // search each port name in the range of this instance
-    let hints: VerilogPortHint[] = []
-
-    const fullRange = inst.getFullRange()
-    const instTextIndex = this.doc.offsetAt(fullRange.start)
-    const instText = this.doc.getText(fullRange)
-
-    // do implicit ports
-    if (wildcardPorts) {
-      const instNameInd = instText.indexOf(inst.name)
-      const dotStar = instText.indexOf('.*', instNameInd)
-      if (dotStar !== -1 && ports.length > 0) {
-        // return all ports as a single multiline hint
-        let hover = ports.map((port) => port.name).join(', ')
-        hover = ': ' + hover
-        hints.push(
-          new VerilogPortHint(
-            this.doc.positionAt(instTextIndex + dotStar + 2),
-            hover,
-            vscode.InlayHintKind.Type,
-            true
-          )
-        )
-      }
+    const ports = (await module.getSymbols({ type: 'port' }, false)).filter(
+      (port) => port.parentScope === inst.typeRef
+    )
+    if (ports.length === 0) {
+      return []
     }
-
-    // do explicit/implicit ports
-    if (
-      normalPorts === InlayPorts.ON ||
-      (normalPorts === InlayPorts.HOVER && this.hoverSet.has(inst.name))
-    ) {
-      const portHintMap = new Map<string, VerilogPortHint>()
-      let match
-      const wordRe = /\s\.(\w+)\b/g
-      let longestHint = 0
-      while ((match = wordRe.exec(instText)) !== null) {
-        const portName = match[1]
-        const portSym = portMap.get(portName)
-        if (match.index === undefined) {
-          break
-        }
-        if (portSym !== undefined) {
-          let hover = portSym.getHoverText()
-          hover = hover.substring(0, hover.lastIndexOf(portSym.name) - 1)
-          hover = hover.startsWith('(') ? hover.slice(1) : hover
-          const hintPos = this.doc.positionAt(instTextIndex + match.index + 2 + portName.length)
-          const parensInd = this.doc.lineAt(hintPos.line).text.indexOf('(')
-          const hint = new VerilogPortHint(
-            hintPos,
-            ': ' + hover,
-            vscode.InlayHintKind.Type,
-            parensInd === -1
-          )
-          portHintMap.set(portSym.name, hint)
-          // keep track of longest hint for padding
-          if (parensInd !== -1) {
-            longestHint = Math.max(longestHint, hint.label.length)
-          }
-        }
-      }
-      // pad the shorter hints to match the longest
-      for (const [_key, hint] of portHintMap) {
-        // assert that label is string
-        if (!hint.label) {
-          continue
-        }
-        if (hint.label.length < longestHint) {
-          if (!hint.implicit) {
-            hint.label = hint.label + ' '.repeat(longestHint - hint.label.length)
-          }
-        }
-        hints.push(hint)
-      }
-    }
-
-    return hints
+    return [
+      new vscode.InlayHint(
+        this.doc.positionAt(this.doc.offsetAt(fullRange.start) + dotStar + 2),
+        ': ' + ports.map((port) => port.name).join(', '),
+        vscode.InlayHintKind.Type
+      ),
+    ]
   }
 }

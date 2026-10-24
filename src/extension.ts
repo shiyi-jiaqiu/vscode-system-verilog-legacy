@@ -2,47 +2,22 @@
 import { TextEncoder } from 'util'
 import * as vscode from 'vscode'
 
-import * as child_process from 'child_process'
 import { glob } from 'glob'
 import path from 'path'
 import { promisify } from 'util'
 import { CtagsServerComponent } from './analysis/CtagsServerComponent'
 import { Filelist, readFilelist } from './Filelist'
-import { SystemVerilogFormatProvider, VerilogFormatProvider } from './FormatProvider'
-import { IncludeConfig } from './IncludeConfig'
+import { FormatProvider } from './FormatProvider'
 import { InactiveRegionsComponent } from './InactiveRegionsComponent'
 import { IndexComponent } from './IndexComponent'
-import { InlayHintsComponent } from './InlayHintsComponent'
-import {
-  ActivityBarComponent,
-  CommandNode,
-  ConfigObject,
-  EditorButton,
-  ViewContainerSpec,
-} from './lib/libconfig'
+import { ActivityBarComponent, CommandNode, ConfigObject, ViewContainerSpec } from './lib/libconfig'
 import LintManager from './linter/LintManager'
-import { LanguageServerComponent, LanguageServers } from './LSComponent'
 import { SemanticTokensComponent } from './SemanticTokensComponent'
 import { ProjectComponent } from './sidebar/ProjectComponent'
 import { getWorkspaceFolder, pathFilename, zip } from './utils'
 const asyncGlob = promisify(glob)
 
 export var ext: VerilogExtension
-
-export enum SvStandard {
-  SV2005 = 'SystemVerilog-2005',
-  SV2009 = 'SystemVerilog-2009',
-  SV2012 = 'SystemVerilog-2012',
-  SV2017 = 'SystemVerilog-2017',
-  //   sv2023 = 'SystemVerilog2023',
-}
-
-// eslint-disable-next-line @typescript-eslint/naming-convention
-export enum VerilogStandard {
-  V1995 = 'Verilog-95',
-  V2001 = 'Verilog-2001',
-  V2005 = 'Verilog-2005',
-}
 
 export class VerilogExtension extends ActivityBarComponent {
   /// Important components to load first
@@ -52,11 +27,6 @@ export class VerilogExtension extends ActivityBarComponent {
   ////////////////////////////////////////////////
   /// top level configs
   ////////////////////////////////////////////////
-  includes: IncludeConfig = new IncludeConfig({
-    default: [],
-    description: 'Include paths to pass as -I to tools',
-  })
-
   filelist: ConfigObject<string> = new ConfigObject({
     default: '',
     description:
@@ -66,49 +36,24 @@ export class VerilogExtension extends ActivityBarComponent {
   moduleGlobs: ConfigObject<string[]> = new ConfigObject({
     default: ['**/*.{sv,v}'],
     description:
-      'Globs for finding verilog modules, interfaces, and packages for use with the common -y flag',
+      'Without `verilog.filelist`: globs of the module, interface and package files to index',
   })
   includeGlobs: ConfigObject<string[]> = new ConfigObject({
     default: ['**/*.{svh,vh}'],
-    description:
-      'Globs for finding verilog include files (typically svh/vh), used for definition providing. If set to [], it will source from verilog.includes',
+    description: 'Without `verilog.filelist`: globs of the include files to index',
   })
   excludeGlob: ConfigObject<string> = new ConfigObject({
     default: '',
-    description: 'Globs to exclude files',
-  })
-  svStandard: ConfigObject<SvStandard> = new ConfigObject({
-    default: SvStandard.SV2017,
-    description: 'System Verilog standard to use',
-    enum: Object.values(SvStandard),
-  })
-  verilogStandard: ConfigObject<VerilogStandard> = new ConfigObject({
-    default: VerilogStandard.V2005,
-    description: 'System Verilog standard to use',
-    enum: Object.values(VerilogStandard),
-  })
-  formatDirs: ConfigObject<string[]> = new ConfigObject({
-    default: [],
-    description: 'Directories to format',
-  })
-
-  expandMacroScript: ConfigObject<string> = new ConfigObject({
-    default: '',
-    description: 'Script to expand macros. Takes the file as an argument, expects output on stdout',
+    description: 'Without `verilog.filelist`: glob of the files the other globs leave out',
   })
   ////////////////////////////////////////////////
   /// extension subcomponents
   ////////////////////////////////////////////////
   lint: LintManager = new LintManager()
 
-  svFormat: SystemVerilogFormatProvider = new SystemVerilogFormatProvider()
-  verilogFormat: VerilogFormatProvider = new VerilogFormatProvider()
+  format: FormatProvider = new FormatProvider()
 
   project: ProjectComponent = new ProjectComponent()
-
-  languageServer: LanguageServerComponent = new LanguageServerComponent()
-
-  inlayHints: InlayHintsComponent = new InlayHintsComponent()
 
   semanticTokens: SemanticTokensComponent = new SemanticTokensComponent()
 
@@ -224,50 +169,6 @@ export class VerilogExtension extends ActivityBarComponent {
     }
   )
 
-  expandMacros: EditorButton = new EditorButton(
-    {
-      title: 'Expand Macros',
-      shortTitle: 'Expand macros',
-      languages: ['verilog', 'systemverilog'],
-      icon: '$(open-preview)',
-    },
-    async () => {
-      if (ext.expandMacroScript.getValue() === '') {
-        vscode.window.showErrorMessage('`verilog.expandMacroScript` not provided')
-        return
-      }
-      let doc = vscode.window.activeTextEditor?.document
-      if (doc === undefined) {
-        vscode.window.showErrorMessage('Open a verilog document to expand macros')
-        return
-      }
-      let expDir = this.expandDir
-      if (expDir === undefined) {
-        return
-      }
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: 'Expanding macros',
-        },
-        async (progress) => {
-          progress.report({ increment: 0, message: 'Expanding macros' })
-          let expanded = child_process.execSync(
-            ext.expandMacroScript.getValue() + ' ' + doc.uri.fsPath,
-            {
-              cwd: getWorkspaceFolder(),
-            }
-          )
-
-          let uri: vscode.Uri = vscode.Uri.joinPath(expDir, doc.uri.path.split('/').pop()!)
-          await vscode.workspace.fs.writeFile(uri, expanded)
-          await vscode.workspace.openTextDocument(uri)
-          await vscode.commands.executeCommand('vscode.diff', uri, doc.uri)
-        }
-      )
-    }
-  )
-  expandDir: vscode.Uri | undefined = undefined
   context: vscode.ExtensionContext
   /// parsed `verilog.filelist`, if one is configured
   projectFilelist: Filelist | undefined = undefined
@@ -284,25 +185,9 @@ export class VerilogExtension extends ActivityBarComponent {
       'verilog.slangExtensionActive',
       this.slangExtensionActive()
     )
+    // also starts the first check
     this.loadFilelist()
-    // Lets do this quickly
-    vscode.window.visibleTextEditors.forEach((editor) => {
-      this.lint.lint(editor.document)
-    })
-
-    if (context.storageUri !== undefined) {
-      this.expandDir = vscode.Uri.joinPath(context.storageUri, '.sv_cache', 'expanded')
-    }
-
-    /////////////////////////////////////////////
-    // Configure Format on save
-    /////////////////////////////////////////////
-
-    this.onConfigUpdated(() => {
-      this.loadFilelist()
-      this.checkFormatDirs()
-    })
-    await this.checkFormatDirs()
+    context.subscriptions.push(this.filelist.onConfigUpdated(() => this.loadFilelist()))
 
     /////////////////////////////////////////////
     // Slow async tasks
@@ -316,30 +201,20 @@ export class VerilogExtension extends ActivityBarComponent {
     this.logger.info(`${context.extension.id} activation finished.`)
   }
 
-  private async checkFormatDirs() {
-    let dirs = this.formatDirs.getValue()
-    this.svFormat.activateFormatter(dirs, ['sv', 'svh'], 'systemverilog')
-    this.verilogFormat.activateFormatter(dirs, ['v', 'vh'], 'verilog')
-  }
-
   private async indexFiles(reset: boolean = false) {
     if (!(await this.ctags.path.checkPathNotify())) {
       return
     }
 
-    if (this.ctagsEnabled()) {
-      this.index
-        .indexIncludes(reset)
-        .then(() => {
-          this.logger.info('ctags index includes finished')
-        })
-        .catch((err) => {
-          this.logger.error('ctags index includes failed:')
-          this.logger.error(err)
-        })
-    } else {
-      this.logger.info('ctags disabled, not indexing includes')
-    }
+    this.index
+      .indexIncludes(reset)
+      .then(() => {
+        this.logger.info('ctags index includes finished')
+      })
+      .catch((err) => {
+        this.logger.error('ctags index includes failed:')
+        this.logger.error(err)
+      })
 
     // index all files (symlinks in .sv_cache/files + in memory cache)
     this.index
@@ -358,35 +233,26 @@ export class VerilogExtension extends ActivityBarComponent {
     this.projectFilelist = undefined
     const configured = this.filelist.getValue()
     const ws = getWorkspaceFolder()
-    if (configured === '' || ws === undefined) {
-      return
-    }
-    const file = path.resolve(ws, configured)
-    try {
-      this.projectFilelist = readFilelist(file, ws)
-      this.logger.info(
-        `filelist ${file}: ${this.projectFilelist.files.length} files, ${this.projectFilelist.incdirs.length} include dirs`
-      )
-    } catch (e) {
-      this.logger.error(`failed to read filelist ${file}: ${e}`)
-      vscode.window.showErrorMessage(`verilog.filelist: cannot read ${file}`)
+    if (configured !== '' && ws !== undefined) {
+      const file = path.resolve(ws, configured)
+      try {
+        this.projectFilelist = readFilelist(file, ws)
+        this.logger.info(
+          `filelist ${file}: ${this.projectFilelist.files.length} files, ${this.projectFilelist.incdirs.length} include dirs`
+        )
+      } catch (e) {
+        this.logger.error(`failed to read filelist ${file}: ${e}`)
+        vscode.window.showErrorMessage(`verilog.filelist: cannot read ${file}`)
+      }
     }
     this.inactiveRegions.update()
+    this.lint.restart()
   }
 
   /// The Slang extension provides its own hovers, definitions, diagnostics and views,
   /// so ours only add semantic highlighting next to it.
   slangExtensionActive(): boolean {
     return vscode.extensions.getExtension('Hudson-River-Trading.vscode-slang') !== undefined
-  }
-
-  ctagsEnabled(): boolean {
-    return this.languageServer.server.getValue() === LanguageServers.Ctags
-  }
-
-  // TODO: may need this to disable slang linting so we don't get double
-  slangServerEnabled(): boolean {
-    return this.languageServer.server.getValue() === LanguageServers.Slang
   }
 
   public async findFiles(globs: string[]): Promise<vscode.Uri[]> {
@@ -410,33 +276,29 @@ export class VerilogExtension extends ActivityBarComponent {
     return uris
   }
 
+  /// The headers in the include directories of the filelist, or those matching the globs
   public async findIncludes(): Promise<vscode.Uri[]> {
-    let incGlobs = this.includeGlobs.getValue()
-    if (incGlobs.length === 0) {
-      incGlobs = this.includes.getValue().map((inc) => {
-        return inc + '/*.svh'
-      })
+    if (this.projectFilelist === undefined) {
+      return await this.findFiles(this.includeGlobs.getValue())
     }
-    const incdirs = this.projectFilelist?.incdirs ?? []
-    return uniqueUris(
-      await this.findFiles(incGlobs.concat(incdirs.map((dir) => dir + '/**/*.{svh,vh}')))
+    const globs = this.projectFilelist.incdirs.map((dir) => dir + '/**/*.{svh,vh}')
+    // nested include directories find a header twice
+    return Array.from(
+      new Map((await this.findFiles(globs)).map((uri) => [uri.fsPath, uri])).values()
     )
   }
 
+  /// The sources of the filelist, or those matching the globs
   public async findModules(): Promise<vscode.Uri[]> {
-    const listed = (this.projectFilelist?.files ?? []).map((file) => vscode.Uri.file(file))
-    return uniqueUris((await this.findFiles(this.moduleGlobs.getValue())).concat(listed))
+    if (this.projectFilelist === undefined) {
+      return await this.findFiles(this.moduleGlobs.getValue())
+    }
+    return this.projectFilelist.files.map((file) => vscode.Uri.file(file))
   }
-}
-
-// filelist entries and include directories may also match the workspace globs
-function uniqueUris(uris: vscode.Uri[]): vscode.Uri[] {
-  return Array.from(new Map(uris.map((uri) => [uri.fsPath, uri])).values())
 }
 
 export async function deactivate(): Promise<void> {
   ext.logger.info('Deactivated')
-  await ext.languageServer.stop()
 }
 
 export async function activate(context: vscode.ExtensionContext) {
