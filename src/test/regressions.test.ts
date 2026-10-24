@@ -5,7 +5,7 @@ import * as path from 'path'
 import * as vscode from 'vscode'
 import { evalConst } from '../analysis/ConstValue'
 import { readFilelist, resolveInclude } from '../Filelist'
-import { TemplateMirror } from '../linter/TemplateMirror'
+import { SourceDependencies } from '../linter/SourceDependencies'
 
 suite('Review regressions', function () {
   this.timeout(30000)
@@ -44,6 +44,42 @@ suite('Review regressions', function () {
     assert.strictEqual(tree.length, 600)
     assert.strictEqual(tree[599].name, 'm599')
     assert.strictEqual(tree[599].children.length, 60)
+  })
+
+  test('nested filelists retain slang path, quote and environment semantics', async () => {
+    const lists = path.join(dir, 'lists space')
+    const deep = path.join(lists, 'inner')
+    await fs.promises.mkdir(deep, { recursive: true })
+    const main = path.join(dir, 'nested.f')
+    const outer = path.join(lists, 'outer.f')
+    const nested = path.join(lists, 'nested.f')
+    const inner = path.join(deep, 'deep.f')
+    const previous = process.env.VERILOG_TEST_INCLUDE_DIR
+    process.env.VERILOG_TEST_INCLUDE_DIR = path.join(dir, 'include space')
+    try {
+      await fs.promises.writeFile(main, '-F "lists space/outer.f" // comment\n')
+      await fs.promises.writeFile(outer, '-f nested.f\n-F inner/deep.f\n')
+      await fs.promises.writeFile(
+        nested,
+        '-I"${VERILOG_TEST_INCLUDE_DIR}"\n+define+LABEL="text // # value"\n"../rtl one.sv"\n'
+      )
+      await fs.promises.writeFile(inner, '/* comment */ deep.sv\n')
+      const result = readFilelist(main, dir)
+      assert.deepStrictEqual(result.files, [
+        path.join(dir, 'rtl one.sv'),
+        path.join(deep, 'deep.sv'),
+      ])
+      assert.deepStrictEqual(result.incdirs, [process.env.VERILOG_TEST_INCLUDE_DIR])
+      assert.strictEqual(result.defines.get('LABEL'), 'text // # value')
+      assert.deepStrictEqual(result.commandFiles, [main, outer, nested, inner])
+      await fs.promises.appendFile(inner, '-F ../outer.f\n')
+      assert.throws(() => readFilelist(main, dir), /Recursive filelist/)
+      delete process.env.VERILOG_TEST_INCLUDE_DIR
+      assert.throws(() => readFilelist(main, dir), /unset or empty/)
+    } finally {
+      if (previous === undefined) delete process.env.VERILOG_TEST_INCLUDE_DIR
+      else process.env.VERILOG_TEST_INCLUDE_DIR = previous
+    }
   })
 
   test('concurrent semantic requests return the same tokens as serial requests', async () => {
@@ -117,29 +153,23 @@ suite('Review regressions', function () {
     assert.ok(!ext.index.moduleMap.has('p'))
   })
 
-  test('deleted and shadowed includes do not survive in the template mirror', async () => {
+  test('deleted and shadowed includes update the template dependency graph', async () => {
     const root = path.join(dir, 'mirror-input')
     const include = path.join(root, 'inc')
     await fs.promises.mkdir(include, { recursive: true })
     const file = path.join(root, 'top.sv')
     const local = path.join(root, 'defs.svh')
     const other = path.join(include, 'defs.svh')
-    await fs.promises.writeFile(
-      file,
-      '<perl>my $x=1;</perl>\n`include "defs.svh"\nmodule top; endmodule\n'
-    )
-    await fs.promises.writeFile(local, '`define WIDTH 1\n')
-    await fs.promises.writeFile(other, '`define WIDTH 2\n')
-    const mirror = new TemplateMirror(path.join(dir, 'mirror'))
-    await mirror.update([file], [include])
-    assert.ok(fs.existsSync(mirror.copyOf(local)))
+    await fs.promises.writeFile(file, '`include "defs.svh"\nmodule top; endmodule\n')
+    await fs.promises.writeFile(local, '<pl>1</pl>\n')
+    await fs.promises.writeFile(other, '<pl>2</pl>\n')
+    const sources = new SourceDependencies()
+    assert.ok((await sources.update([file], [include])).has(file))
     await fs.promises.unlink(local)
-    await mirror.update([file], [include])
-    assert.ok(!fs.existsSync(mirror.copyOf(local)))
-    assert.ok(fs.existsSync(mirror.copyOf(other)))
+    assert.ok((await sources.update([file], [include])).has(file))
+    assert.ok(!sources.affectedBy(new Set([local])).has(file))
     await fs.promises.unlink(other)
-    await mirror.update([file], [include])
-    assert.ok(!fs.existsSync(mirror.copyOf(other)))
+    assert.ok(!(await sources.update([file], [include])).has(file))
   })
 
   test('include navigation selects the includer directory before incdir', async () => {
@@ -163,6 +193,39 @@ suite('Review regressions', function () {
     assert.strictEqual(evalConst('(8 + 2) * 4'), 40n)
   })
 
+  test('unexpanded Perl files skip semantic checks and retain only static declarations', async () => {
+    await vscode.workspace
+      .getConfiguration('verilog')
+      .update('lint.slang.analysis', 'full', vscode.ConfigurationTarget.Workspace)
+    await pause(100)
+    ext.projectFilelist = undefined
+    const file = path.join(dir, 'inline.sv')
+    await fs.promises.writeFile(
+      file,
+      [
+        'module child(input logic foo); endmodule',
+        'module inline_template;',
+        'logic a;',
+        'child u(.foo_<pl>$i</pl>(a));',
+        '<perl>if ($enabled) {</perl>',
+        'wire generated_signal;',
+        'generated code that is not Verilog',
+        '<perl>}</perl>',
+        'assign generated_signal = a;',
+        'logic outside = ;',
+        'endmodule',
+      ].join('\n')
+    )
+    const doc = await vscode.workspace.openTextDocument(file)
+    await ext.lint.slang.lint(doc)
+    const diagnostics = vscode.languages.getDiagnostics(doc.uri)
+    assert.deepStrictEqual(diagnostics, [])
+    assert.ok(ext.server.isSkipped(doc))
+    const names = (await ext.index.getVerilogDoc(doc).getSymbols()).map((symbol) => symbol.name)
+    assert.ok(names.includes('a'))
+    assert.ok(!names.includes('foo_'))
+  })
+
   test('disabling single-file lint discards a running check', async () => {
     await vscode.workspace
       .getConfiguration('verilog')
@@ -180,6 +243,7 @@ suite('Review regressions', function () {
     await vscode.workspace
       .getConfiguration('verilog')
       .update('lint.slang.path', tool, vscode.ConfigurationTarget.Workspace)
+    await pause(100) // let configuration restart finish before starting the check under test
     const running = ext.lint.slang.lint(doc)
     for (let i = 0; i < 100 && !fs.existsSync(marker); i++) {
       await pause(20)
@@ -190,5 +254,40 @@ suite('Review regressions', function () {
       .update('lint.slang.enabled', false, vscode.ConfigurationTarget.Workspace)
     await running
     assert.deepStrictEqual(vscode.languages.getDiagnostics(doc.uri), [])
+  })
+
+  test('saving an included .sv file rechecks its open source in CLI mode', async () => {
+    await vscode.workspace
+      .getConfiguration('verilog')
+      .update('lint.slang.enabled', true, vscode.ConfigurationTarget.Workspace)
+    await vscode.workspace
+      .getConfiguration('verilog')
+      .update('lint.slang.path', 'slang', vscode.ConfigurationTarget.Workspace)
+    await vscode.workspace
+      .getConfiguration('verilog')
+      .update('lint.slang.runOnSave', true, vscode.ConfigurationTarget.Workspace)
+    const include = path.join(dir, 'included.sv')
+    const file = path.join(dir, 'includer.sv')
+    await fs.promises.writeFile(include, '`define VALUE 1\n')
+    await fs.promises.writeFile(
+      file,
+      '`include "included.sv"\nmodule includer; localparam int X=`VALUE; endmodule\n'
+    )
+    const source = await vscode.workspace.openTextDocument(file)
+    await vscode.window.showTextDocument(source, { preview: false })
+    await ext.lint.slang.lint(source)
+    assert.ok(!ext.server.isSkipped(source))
+    const header = await vscode.workspace.openTextDocument(include)
+    const edit = new vscode.WorkspaceEdit()
+    edit.insert(header.uri, new vscode.Position(0, 0), '<pl>$i</pl>\n')
+    await vscode.workspace.applyEdit(edit)
+    await header.save()
+    for (let i = 0; i < 50 && !ext.server.isSkipped(source); i++) {
+      await pause(100)
+    }
+    assert.ok(ext.server.isSkipped(source), 'the includer must stop semantic checks')
+    await vscode.workspace
+      .getConfiguration('verilog')
+      .update('lint.slang.runOnSave', false, vscode.ConfigurationTarget.Workspace)
   })
 })

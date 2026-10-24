@@ -1,0 +1,450 @@
+diff --git a/include/Config.h b/include/Config.h
+index d8ccf70..d32b079 100644
+--- a/include/Config.h
++++ b/include/Config.h
+@@ -44,6 +44,11 @@ struct Config {
+                      std::string>
+         flags;
+ 
++    rfl::Description<"Editor warning controls, without the -W prefix. Changes to the same "
++                     "warning groups refresh cached diagnostics without rebuilding analysis.",
++                     std::vector<std::string>>
++        diagnosticWarnings = {};
++
+     /// Ordered include directories, with environment variables expanded before path resolution.
+     rfl::Description<"Include directories, relative to the workspace root. Searched after "
+                      "directories supplied through flags and build files. Supports $VAR, "
+diff --git a/include/ServerDiagClient.h b/include/ServerDiagClient.h
+index 251b930..aa1cc6f 100644
+--- a/include/ServerDiagClient.h
++++ b/include/ServerDiagClient.h
+@@ -30,6 +30,11 @@ public:
+     /// report unpublished diags to the client, doing the specified uri first
+     void pushDiags(const URI& priorityUri);
+ 
++    void setVersion(const URI& uri, std::optional<int32_t> version) {
++        m_versions[uri] = version;
++        m_dirtyUris.emplace(uri);
++    }
++
+     // Clear a specific URI's diagnostics, put not publishing to client, since they are still likely
+     // relevant
+     void clear(URI uri);
+@@ -48,6 +53,7 @@ public:
+ #endif
+ 
+ private:
++    std::unordered_map<URI, std::optional<int32_t>> m_versions;
+     std::unordered_map<URI, std::vector<lsp::Diagnostic>> m_diagnostics;
+     // Uris that have modified diags yet to be pushed to the client
+     slang::flat_hash_set<URI> m_dirtyUris;
+diff --git a/include/ServerDriver.h b/include/ServerDriver.h
+index 6bdd200..6aea40f 100644
+--- a/include/ServerDriver.h
++++ b/include/ServerDriver.h
+@@ -75,7 +75,8 @@ public:
+     };
+ 
+     /// @brief Gets a document by URI, creating it if it doesn't exist
+-    void openDocument(const URI& uri, const std::string_view text);
++    void openDocument(const URI& uri, const std::string_view text,
++                      std::optional<int32_t> version = std::nullopt);
+ 
+     /// @brief Close a document and remove it from the open docs set
+     void closeDocument(const URI& uri);
+@@ -92,6 +93,8 @@ public:
+     /// @brief Checks if a document is open
+     bool isDocumentOpen(const URI& uri);
+ 
++    void refreshDiagnosticWarnings(const std::vector<std::string>& warnings);
++
+     /// @brief Handle workspace file change notifications from the file watcher
+     /// Reloads disk-backed dependencies before analysis, preserving editor-owned buffers.
+     void onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesParams& params);
+diff --git a/include/SlangLspClient.h b/include/SlangLspClient.h
+index 2bc0059..7bbddb8 100644
+--- a/include/SlangLspClient.h
++++ b/include/SlangLspClient.h
+@@ -62,9 +62,8 @@ public:
+         /// [`textDocument.completion.completionItem.resolveSupport`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionClientCapabilities)
+         bool completionEditResolveSupported = false;
+ 
+-        /// client offered "utf-8" in `general.positionEncodings`, which matches slang's byte
+-        /// columns. Otherwise only didChange ranges are converted from utf-16; other positions
+-        /// stay byte-based, which only differs on lines with non-ASCII comments.
++        /// This build selects mandatory LSP UTF-16 for every request and response.
++        /// Slang's internal byte offsets are converted at the protocol boundary.
+         bool utf8Positions = false;
+ 
+         Capabilities() = default;
+@@ -87,11 +86,6 @@ public:
+                                                  supports("textEdit");
+             }
+ 
+-            if (capabilities.general && capabilities.general->positionEncodings) {
+-                const auto& encs = *capabilities.general->positionEncodings;
+-                utf8Positions = std::ranges::find(encs, "utf-8") != encs.end();
+-            }
+-
+             if (!capabilities.experimental)
+                 return;
+ 
+diff --git a/include/SlangServer.h b/include/SlangServer.h
+index 13859d9..28ee814 100644
+--- a/include/SlangServer.h
++++ b/include/SlangServer.h
+@@ -87,7 +87,7 @@ protected:
+     void registerFileWatchers();
+ 
+     /// Reload config and active build files, retaining the current state on failure.
+-    void reloadWatchedConfig();
++    void reloadWatchedConfig(bool diagnosticRefresh = false);
+ 
+     /// Indexes the workspace for top symbols and macros
+     Indexer m_indexer;
+@@ -105,7 +105,7 @@ public:
+     /// ./slang/server.json
+     /// ./slang/local/server.json
+     /// Automatic reloads require valid files and retain the current driver on failure.
+-    bool loadConfig(bool requireValidConfig = false);
++    bool loadConfig(bool requireValidConfig = false, bool diagnosticRefresh = false);
+ 
+     /// Load the configuration from a given config object, reindex if needed or forced
+     /// Returns false when an automatic reload cannot construct a valid replacement.
+diff --git a/include/document/SlangDoc.h b/include/document/SlangDoc.h
+index 999340e..edcf4c3 100644
+--- a/include/document/SlangDoc.h
++++ b/include/document/SlangDoc.h
+@@ -76,6 +76,9 @@ private:
+     std::shared_ptr<ShallowAnalysis> refreshAnalysis(const lsp::RequestContext& ctx);
+ 
+ public:
++    /// Editor version of this exact buffer; disk-only documents have no version.
++    std::optional<int32_t> version;
++
+     SlangDoc(ServerDriver& driver, URI uri, slang::SourceBuffer buffer);
+ 
+     /// Macro-definition-only files use standalone analysis without include-context selection.
+diff --git a/include/lsp/LspTypeExtensions.h b/include/lsp/LspTypeExtensions.h
+index 27f2a77..4bf6d45 100644
+--- a/include/lsp/LspTypeExtensions.h
++++ b/include/lsp/LspTypeExtensions.h
+@@ -34,6 +34,7 @@ struct ExperimentalClientCapabilities {
+ struct InactiveRegionsParams {
+     URI uri;
+     std::vector<Range> regions;
++    std::optional<int32_t> version;
+ };
+ 
+ } // namespace lsp
+diff --git a/src/ServerDiagClient.cpp b/src/ServerDiagClient.cpp
+index 2685327..828a131 100644
+--- a/src/ServerDiagClient.cpp
++++ b/src/ServerDiagClient.cpp
+@@ -267,11 +267,11 @@ void ServerDiagClient::clear(URI uri) {
+ void ServerDiagClient::clearAndPush() {
+     for (const auto& [uri, diags] : m_diagnostics) {
+         m_client.onDocPublishDiagnostics(
+-            lsp::PublishDiagnosticsParams{.uri = uri, .diagnostics = {}});
++            lsp::PublishDiagnosticsParams{.uri = uri, .version = m_versions[uri], .diagnostics = {}});
+     }
+     for (auto& uri : m_dirtyUris) {
+         m_client.onDocPublishDiagnostics(
+-            lsp::PublishDiagnosticsParams{.uri = uri, .diagnostics = {}});
++            lsp::PublishDiagnosticsParams{.uri = uri, .version = m_versions[uri], .diagnostics = {}});
+     }
+     m_diagnostics.clear();
+     m_dirtyUris.clear();
+@@ -289,11 +289,11 @@ void ServerDiagClient::pushDiags(const URI& priorityUri) {
+     auto it = m_diagnostics.find(priorityUri);
+     if (it != m_diagnostics.end()) {
+         m_client.onDocPublishDiagnostics(
+-            lsp::PublishDiagnosticsParams{.uri = priorityUri, .diagnostics = it->second});
++            lsp::PublishDiagnosticsParams{.uri = priorityUri, .version = m_versions[priorityUri], .diagnostics = it->second});
+     }
+     else if (m_dirtyUris.contains(priorityUri)) {
+         m_client.onDocPublishDiagnostics(
+-            lsp::PublishDiagnosticsParams{.uri = priorityUri, .diagnostics = {}});
++            lsp::PublishDiagnosticsParams{.uri = priorityUri, .version = m_versions[priorityUri], .diagnostics = {}});
+     }
+     m_dirtyUris.erase(priorityUri);
+     pushDiags();
+@@ -304,11 +304,11 @@ void ServerDiagClient::pushDiags() {
+         auto it = m_diagnostics.find(uri);
+         if (it != m_diagnostics.end()) {
+             m_client.onDocPublishDiagnostics(
+-                lsp::PublishDiagnosticsParams{.uri = uri, .diagnostics = it->second});
++                lsp::PublishDiagnosticsParams{.uri = uri, .version = m_versions[uri], .diagnostics = it->second});
+         }
+         else {
+             m_client.onDocPublishDiagnostics(
+-                lsp::PublishDiagnosticsParams{.uri = uri, .diagnostics = {}});
++                lsp::PublishDiagnosticsParams{.uri = uri, .version = m_versions[uri], .diagnostics = {}});
+         }
+     }
+     m_dirtyUris.clear();
+diff --git a/src/ServerDriver.cpp b/src/ServerDriver.cpp
+index 5cd6d93..3b49c5a 100644
+--- a/src/ServerDriver.cpp
++++ b/src/ServerDriver.cpp
+@@ -165,6 +165,7 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
+     // Configure diagnostic engine. The LSP server reports warnings as editor
+     // diagnostics by default; user-provided -Wno-* mappings still suppress
+     // specific warnings via the severity table populated by processOptions().
++    diagEngine.issue(diagEngine.setWarningOptions(m_config.diagnosticWarnings.value()));
+     diagEngine.setIgnoreAllWarnings(false);
+     diagEngine.setIgnoreAllNotes(false);
+ 
+@@ -200,11 +201,28 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
+     return ok;
+ }
+ 
++void ServerDriver::refreshDiagnosticWarnings(const std::vector<std::string>& warnings) {
++    m_config.diagnosticWarnings = warnings;
++    diagEngine.issue(diagEngine.setWarningOptions(warnings));
++    diagEngine.setIgnoreAllWarnings(false);
++    diagClient->clear();
++    if (comp) {
++        publishCompilationDiagnostics();
++    }
++    else {
++        for (const auto& uri : m_openDocs) {
++            if (auto it = docs.find(uri); it != docs.end())
++                analyzeDocument(*it->second);
++        }
++    }
++}
++
+ void ServerDriver::analyzeDocument(SlangDoc& doc, const lsp::RequestContext& ctx) {
+     ctx.throwIfCancelled("before diagnostics");
+ 
+     // Clear and re-issue diagnostics for this document
+     diagClient->clear(doc.getURI());
++    diagClient->setVersion(doc.getURI(), doc.version);
+ 
+     // Pragma mappings are populated from the preprocessor/lexer
+     doc.getSyntaxTree();
+@@ -262,6 +280,7 @@ void ServerDriver::onDocDidSave(SlangDoc& doc) {
+ void ServerDriver::publishCompilationDiagnostics(const URI* priorityUri) {
+     diagEngine.setMappingsFromPragmas();
+     for (const auto& entry : docs) {
++        diagClient->setVersion(entry.first, entry.second->version);
+         entry.second->issueParseDiagnostics(diagEngine);
+     }
+     comp->issueDiagnosticsTo(diagEngine);
+@@ -288,7 +307,7 @@ void ServerDriver::copyOpenDocumentsFrom(const ServerDriver* oldDriver) {
+         // openDocument expects no \0
+         auto text = docIt->second->getText();
+         text.remove_suffix(1);
+-        openDocument(uri, text);
++        openDocument(uri, text, docIt->second->version);
+     }
+ }
+ 
+@@ -336,7 +355,8 @@ std::unique_ptr<ServerDriver> ServerDriver::createFromFileLists(
+     return newDriver;
+ }
+ 
+-void ServerDriver::openDocument(const URI& uri, const std::string_view text) {
++void ServerDriver::openDocument(const URI& uri, const std::string_view text,
++                               std::optional<int32_t> version) {
+     auto docIter = docs.find(uri);
+     std::shared_ptr<SlangDoc> doc;
+     bool matchesBuildSource = false;
+@@ -362,7 +382,10 @@ void ServerDriver::openDocument(const URI& uri, const std::string_view text) {
+         docs[uri] = doc;
+     }
+ 
++    doc->version = version;
+     if (comp && matchesBuildSource) {
++        diagClient->setVersion(uri, version);
++        diagClient->pushDiags(uri);
+         // File is already part of the compilation — compilation diags were
+         // already published, so skip shallow diags. Still publish inactive regions.
+         publishInactiveRegions(*doc);
+@@ -400,6 +423,7 @@ void ServerDriver::onDocDidChange(const lsp::DidChangeTextDocumentParams& params
+     }
+ 
+     doc->onChange(params.contentChanges);
++    doc->version = params.textDocument.version;
+     if (ctx.isCancelled()) {
+         ctx.info("Applied changes for {}; skipping superseded analysis", doc->getWsRelativePath());
+         ctx.throwIfCancelled("before analysis");
+@@ -1740,6 +1764,7 @@ void ServerDriver::publishInactiveRegions(SlangDoc& doc, const lsp::RequestConte
+     client.onTextDocumentInactiveRegions(lsp::InactiveRegionsParams{
+         .uri = doc.getURI(),
+         .regions = std::move(regions),
++        .version = doc.version,
+     });
+ }
+ 
+diff --git a/src/SlangServer.cpp b/src/SlangServer.cpp
+index 9635833..15599c1 100644
+--- a/src/SlangServer.cpp
++++ b/src/SlangServer.cpp
+@@ -255,9 +255,7 @@ lsp::InitializeResult SlangServer::getInitialize(const lsp::InitializeParams& pa
+     auto result = lsp::InitializeResult{
+         .capabilities =
+             lsp::ServerCapabilities{
+-                .positionEncoding = m_client.capabilities.utf8Positions
+-                                        ? std::optional<lsp::PositionEncodingKind>("utf-8")
+-                                        : std::nullopt,
++                .positionEncoding = lsp::PositionEncodingKind("utf-16"),
+                 .textDocumentSync =
+                     lsp::TextDocumentSyncOptions{
+                         .openClose = true,
+@@ -872,7 +870,7 @@ bool SlangServer::loadConfig(const Config& config, bool forceIndexing, bool requ
+     return true;
+ }
+ 
+-bool SlangServer::loadConfig(bool requireValidConfig) {
++bool SlangServer::loadConfig(bool requireValidConfig, bool diagnosticRefresh) {
+     std::optional<std::string> workspaceConf, userConf, localConf;
+ 
+     if (m_workspaceFolder) {
+@@ -897,7 +895,39 @@ bool SlangServer::loadConfig(bool requireValidConfig) {
+         m_client.showError(config.error().what());
+         return m_driver ? false : loadConfig(Config{}, true);
+     }
+-    return loadConfig(*config, true, requireValidConfig);
++    if (diagnosticRefresh && m_driver &&
++        config->diagnosticWarnings.value() != m_config.diagnosticWarnings.value()) {
++        auto before = m_config;
++        auto after = *config;
++        before.diagnosticWarnings.value().clear();
++        after.diagnosticWarnings.value().clear();
++        auto groups = [](const auto& warnings) {
++            std::vector<std::string> names;
++            for (const auto& warning : warnings)
++                names.push_back(warning.starts_with("no-") ? warning.substr(3) : warning);
++            std::sort(names.begin(), names.end());
++            return names;
++        };
++        // Only the same complete set of controls can be updated in place. Removing
++        // controls or changing any compiler setting rebuilds their original mappings.
++        if (rfl::json::write(before) == rfl::json::write(after) &&
++            groups(config->diagnosticWarnings.value()) == groups(m_config.diagnosticWarnings.value())) {
++            INFO("Refreshing diagnostic warnings from cached analysis");
++            m_driver->refreshDiagnosticWarnings(config->diagnosticWarnings.value());
++            m_config = *config;
++            m_client.setConfig(m_config);
++            m_configReloadPending = false;
++            return true;
++        }
++    }
++    // Warning and macro changes do not change the metadata index's roots.
++    const bool indexChanged = !m_driver ||
++        rfl::json::write(m_config.index.value()) != rfl::json::write(config->index.value()) ||
++        m_config.getIndexGlobs() != config->getIndexGlobs() ||
++        m_config.excludeDirs.value() != config->excludeDirs.value() ||
++        m_config.env.value() != config->env.value() ||
++        m_config.indexingThreads.value() != config->indexingThreads.value();
++    return loadConfig(*config, indexChanged, requireValidConfig);
+ }
+ 
+ std::monostate SlangServer::addDefine(const std::string& macroName) {
+@@ -1318,7 +1348,8 @@ std::monostate SlangServer::onShutdown(const std::nullopt_t&) {
+ }
+ 
+ void SlangServer::onDocDidOpen(const lsp::DidOpenTextDocumentParams& params) {
+-    m_driver->openDocument(params.textDocument.uri, params.textDocument.text);
++    m_driver->openDocument(params.textDocument.uri, params.textDocument.text,
++                           params.textDocument.version);
+ }
+ 
+ void SlangServer::onDocDidChange(const lsp::DidChangeTextDocumentParams& params,
+@@ -1345,7 +1376,7 @@ void SlangServer::onDocDidSave(const lsp::DidSaveTextDocumentParams& params) {
+         if (!doc->textMatches(text)) {
+             // Recover by overwriting the buffer with the saved text
+             INFO("Document text does not match on save, overwriting");
+-            m_driver->openDocument(params.textDocument.uri, text);
++            m_driver->openDocument(params.textDocument.uri, text, doc->version);
+             doc = m_driver->getDocument(params.textDocument.uri);
+         }
+     }
+@@ -1363,7 +1394,7 @@ void SlangServer::registerFileWatchers() {
+     m_fileWatchers = {};
+     m_fileWatchers.addExtensions({".json"},
+                                  [this](const lsp::DidChangeWatchedFilesParams&) {
+-                                     reloadWatchedConfig();
++                                     reloadWatchedConfig(true);
+                                      return true;
+                                  },
+                                  {".slang/server.json", ".slang/local/server.json"});
+@@ -1389,11 +1420,12 @@ void SlangServer::registerFileWatchers() {
+                                  });
+ }
+ 
+-void SlangServer::reloadWatchedConfig() {
++void SlangServer::reloadWatchedConfig(bool diagnosticRefresh) {
+     INFO("Config or build file changed, reloading");
+     auto savedTop = m_topFile;
+-    if (loadConfig(/* requireValidConfig */ true)) {
+-        if (savedTop)
++    auto previousDriver = m_driver.get();
++    if (loadConfig(/* requireValidConfig */ true, diagnosticRefresh)) {
++        if (savedTop && m_driver.get() != previousDriver)
+             setTopLevel(*savedTop);
+         return;
+     }
+diff --git a/src/util/Converters.cpp b/src/util/Converters.cpp
+index 4a56e91..427686c 100644
+--- a/src/util/Converters.cpp
++++ b/src/util/Converters.cpp
+@@ -45,15 +45,28 @@ std::optional<const parsing::Token> findNameToken(const syntax::SyntaxNode* node
+ 
+ lsp::Position toPosition(const SourceLocation& loc, const SourceManager& sourceManager) {
+     auto actualLoc = sourceManager.getFullyExpandedLoc(loc);
+-    auto character = sourceManager.getColumnNumber(actualLoc);
++    auto byteColumn = sourceManager.getColumnNumber(actualLoc);
++    auto text = sourceManager.getSourceText(actualLoc.buffer());
++    const auto start = actualLoc.offset() - (byteColumn > 0 ? byteColumn - 1 : 0);
++    auto prefix = text.substr(start, actualLoc.offset() - start);
++    size_t character = 0;
++    for (size_t offset = 0; offset < prefix.size();) {
++        auto length = std::max(size_t(1), validUtf8SequenceLength(prefix.substr(offset)));
++        character += length == 4 ? 2 : 1;
++        offset += length;
++    }
+     return lsp::Position{.line = static_cast<lsp::uint>(sourceManager.getRawLineNumber(actualLoc) -
+                                                         1),
+-                         .character = static_cast<lsp::uint>(character > 0 ? character - 1 : 0)};
++                         .character = static_cast<lsp::uint>(character)};
+ }
+ 
+ std::optional<SourceLocation> toSourceLocation(BufferID buffer, const lsp::Position& position,
+                                                const SourceManager& sourceManager) {
+-    return sourceManager.getSourceLocation(buffer, position.line + 1, position.character + 1);
++    auto line = sourceManager.getSourceLocation(buffer, position.line + 1, 1);
++    if (!line)
++        return std::nullopt;
++    auto text = sourceManager.getSourceText(buffer).substr(line->offset());
++    return *line + utf16ColumnToByte(text, position.character);
+ }
+ 
+ size_t utf16ColumnToByte(std::string_view line, uint32_t character) {
+@@ -94,10 +107,7 @@ lsp::Location toOriginalLocation(const SourceRange& range, const SourceManager&
+ lsp::Range toRange(const SourceLocation& loc, const SourceManager& sourceManager,
+                    const size_t length) {
+ 
+-    auto start = toPosition(loc, sourceManager);
+-    lsp::Position end{start};
+-    end.character += length;
+-    return lsp::Range{.start = start, .end = end};
++    return toRange(SourceRange(loc, loc + length), sourceManager);
+ }
+ 
+ lsp::Location toLocation(const SourceRange& range, const SourceManager& sourceManager) {
+diff --git a/src/util/VersionInfo.cpp.in b/src/util/VersionInfo.cpp.in
+index 4a28cae..225cfcb 100644
+--- a/src/util/VersionInfo.cpp.in
++++ b/src/util/VersionInfo.cpp.in
+@@ -25,7 +25,7 @@ int VersionInfo::getPatch() {
+ }
+ 
+ string_view VersionInfo::getHash() {
+-    return "@SLANG_SERVER_VERSION_HASH@"sv;
++    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.0"sv;
+ }
+ 
+ }

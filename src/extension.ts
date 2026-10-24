@@ -12,6 +12,7 @@ import { InactiveRegionsComponent } from './InactiveRegionsComponent'
 import { IndexComponent } from './IndexComponent'
 import { ActivityBarComponent, CommandNode, ConfigObject, ViewContainerSpec } from './lib/libconfig'
 import LintManager from './linter/LintManager'
+import { SlangServerComponent } from './SlangServerComponent'
 import { SemanticTokensComponent } from './SemanticTokensComponent'
 import { ProjectComponent } from './sidebar/ProjectComponent'
 import { getWorkspaceFolder, pathFilename, zip } from './utils'
@@ -30,7 +31,7 @@ export class VerilogExtension extends ActivityBarComponent {
   filelist: ConfigObject<string> = new ConfigObject({
     default: '',
     description:
-      'Project filelist relative to the workspace root. Its source files are indexed, +incdir+/-I directories are searched for includes, +define+/-D macros select the active `ifdef branches, and linters get it with -f instead of the current file. Run Reindex after editing it.',
+      'Project filelist relative to the workspace root. Its sources are indexed, include paths and macros are used by lint and indexing, and changes reload automatically. Set verilog.lint.slang.scope to project to lint all sources.',
   })
 
   moduleGlobs: ConfigObject<string[]> = new ConfigObject({
@@ -49,6 +50,8 @@ export class VerilogExtension extends ActivityBarComponent {
   ////////////////////////////////////////////////
   /// extension subcomponents
   ////////////////////////////////////////////////
+  server: SlangServerComponent = new SlangServerComponent()
+
   lint: LintManager = new LintManager()
 
   format: FormatProvider = new FormatProvider()
@@ -68,6 +71,7 @@ export class VerilogExtension extends ActivityBarComponent {
     },
     async () => {
       this.loadFilelist()
+      await this.server.restart()
       return this.indexFiles(true)
         .then(() => {
           vscode.window.showInformationMessage('Reindexing complete')
@@ -172,8 +176,9 @@ export class VerilogExtension extends ActivityBarComponent {
   context: vscode.ExtensionContext
   /// parsed `verilog.filelist`, if one is configured
   projectFilelist: Filelist | undefined = undefined
-  private filelistWatcher: vscode.FileSystemWatcher | undefined
+  private filelistWatcher: vscode.Disposable | undefined
   private filelistChange: NodeJS.Timeout | undefined
+  private filelistSources = new Set<string>()
 
   constructor(context: vscode.ExtensionContext, obj: ViewContainerSpec) {
     super(obj)
@@ -192,8 +197,12 @@ export class VerilogExtension extends ActivityBarComponent {
     this.watchFilelist()
     context.subscriptions.push(
       this.filelist.onConfigUpdated(async () => {
-        this.loadFilelist()
+        const valid = this.loadFilelist()
         this.watchFilelist()
+        if (!valid) {
+          return
+        }
+        await this.server.updateConfiguration()
         await this.indexFiles(true).catch((error) => this.logger.error(String(error)))
       }),
       { dispose: () => this.filelistWatcher?.dispose() }
@@ -205,13 +214,17 @@ export class VerilogExtension extends ActivityBarComponent {
 
     // let ctags index include files
 
+    await this.server.start()
     let tasks = [this.indexFiles().catch((error) => this.logger.error(String(error)))]
     await Promise.all(tasks)
 
     this.logger.info(`${context.extension.id} activation finished.`)
   }
 
-  private async indexFiles(reset: boolean = false) {
+  async indexFiles(reset: boolean = false) {
+    if (this.server.active || this.server.pending || this.slangExtensionActive()) {
+      return
+    }
     if (!(await this.ctags.path.checkPathNotify())) {
       return
     }
@@ -231,41 +244,58 @@ export class VerilogExtension extends ActivityBarComponent {
       return
     }
     const file = path.resolve(ws, configured)
-    this.filelistWatcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(path.dirname(file), path.basename(file))
-    )
     const reload = () => {
       // an editor or a script may write it in several steps
       clearTimeout(this.filelistChange)
       this.filelistChange = setTimeout(() => {
         this.logger.info(`filelist ${file} changed`)
-        this.loadFilelist()
-        this.indexFiles(true).catch((error) => this.logger.error(String(error)))
+        const valid = this.loadFilelist()
+        this.watchFilelist()
+        if (!valid) {
+          return
+        }
+        this.server
+          .updateConfiguration()
+          .then(() => this.indexFiles(true))
+          .catch((error) => this.logger.error(String(error)))
       }, 500)
     }
-    this.filelistWatcher.onDidChange(reload)
-    this.filelistWatcher.onDidCreate(reload)
-    this.filelistWatcher.onDidDelete(reload)
+    const watchers = [...this.filelistSources].map((source) => {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(path.dirname(source), path.basename(source))
+      )
+      watcher.onDidChange(reload)
+      watcher.onDidCreate(reload)
+      watcher.onDidDelete(reload)
+      return watcher
+    })
+    this.filelistWatcher = vscode.Disposable.from(...watchers)
   }
 
-  loadFilelist() {
-    this.projectFilelist = undefined
+  loadFilelist(): boolean {
+    this.filelistSources.clear()
     const configured = this.filelist.getValue()
     const ws = getWorkspaceFolder()
     if (configured !== '' && ws !== undefined) {
       const file = path.resolve(ws, configured)
       try {
-        this.projectFilelist = readFilelist(file, ws)
+        this.projectFilelist = readFilelist(file, ws, (source) => this.filelistSources.add(source))
         this.logger.info(
           `filelist ${file}: ${this.projectFilelist.files.length} files, ${this.projectFilelist.incdirs.length} include dirs`
         )
       } catch (e) {
         this.logger.error(`failed to read filelist ${file}: ${e}`)
-        vscode.window.showErrorMessage(`verilog.filelist: cannot read ${file}`)
+        vscode.window.showErrorMessage(
+          `verilog.filelist: ${e}. Keeping the last valid configuration.`
+        )
+        return false
       }
+    } else {
+      this.projectFilelist = undefined
     }
     this.inactiveRegions.update()
     this.lint.restart()
+    return true
   }
 
   /// The Slang extension provides its own hovers, definitions, diagnostics and views,
@@ -317,6 +347,8 @@ export class VerilogExtension extends ActivityBarComponent {
 }
 
 export async function deactivate(): Promise<void> {
+  await ext.server.stop()
+  ext.lint.slang.stop()
   ext.logger.info('Deactivated')
 }
 

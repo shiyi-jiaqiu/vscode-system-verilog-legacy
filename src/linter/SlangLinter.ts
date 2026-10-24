@@ -4,10 +4,11 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as vscode from 'vscode'
 import { ext } from '../extension'
-import { ConfigObject } from '../lib/libconfig'
+import { ConfigObject, ExtensionComponent } from '../lib/libconfig'
 import { ToolConfig } from '../lib/runner'
 import { getWorkspaceFolder } from '../utils'
-import { TemplateMirror } from './TemplateMirror'
+import { SourceDependencies } from './SourceDependencies'
+import { hasTemplate } from '../Template'
 
 /// One entry of `slang --diag-json`; lines and columns count from 1, range ends are exclusive
 interface SlangDiagnostic {
@@ -38,21 +39,76 @@ const MISSING_CODES = new Set([
 /// Whether checks cover the whole project (a filelist or a selected top module) rather than
 /// the current file
 export function lintsProject(): boolean {
-  return ext.projectFilelist !== undefined || ext.project.top !== undefined
+  return (
+    ext.lint.slang.scope.getValue() === 'project' &&
+    (ext.projectFilelist !== undefined || ext.project.top !== undefined)
+  )
 }
 
-/// Diagnostics by file path, from `slang --diag-json` output. Repeats at the same place (a
-/// header read by each file that includes it) are dropped. Each missing definition is reported
-/// at its first use in a file, with the other uses as related locations, and the parse error
-/// right where the text of an unknown macro was expected goes with that macro. With `mirror`,
-/// slang read copies with Perl template markup blanked out: what it reports about the markup or
-/// right after it is dropped, and so are undeclared names in a file with markup, which the
-/// markup may declare.
+class SlangWarnings extends ExtensionComponent {
+  widthTruncation = new ConfigObject<boolean>({
+    default: true,
+    description: 'Report expression/port width truncation and lossy constant conversions.',
+  })
+  widthExpansion = new ConfigObject<boolean>({
+    default: false,
+    description: 'Report implicit expression/port width expansion.',
+  })
+  signedness = new ConfigObject<boolean>({
+    default: false,
+    description:
+      'Report implicit signedness conversions and comparisons of differently signed values.',
+  })
+  portConnections = new ConfigObject<boolean>({
+    default: true,
+    description: 'Report unconnected ports and explicitly empty input/inout connections.',
+  })
+  implicitNets = new ConfigObject<boolean>({
+    default: true,
+    description: 'Report implicitly declared wires, which can indicate misspelled signal names.',
+  })
+  caseStatements = new ConfigObject<boolean>({
+    default: true,
+    description:
+      'Report missing case defaults, duplicate/overlapping items and incomplete coverage.',
+  })
+  unused = new ConfigObject<boolean>({
+    default: false,
+    description: 'Report unused or undriven signals, ports, parameters and other declarations.',
+  })
+
+  arguments(): string[] {
+    const groups: [ConfigObject<boolean>, string[]][] = [
+      [this.widthTruncation, ['width-trunc', 'port-width-trunc', 'constant-conversion']],
+      [this.widthExpansion, ['width-expand', 'port-width-expand']],
+      [this.signedness, ['sign-conversion', 'sign-compare']],
+      [
+        this.portConnections,
+        [
+          'unconnected-port',
+          'unconnected-unnamed-port',
+          'empty-input-connection',
+          'empty-inout-connection',
+        ],
+      ],
+      [this.implicitNets, ['implicit-net']],
+      [this.caseStatements, ['case-default', 'case-dup', 'case-overlap', 'case-incomplete']],
+      [this.unused, ['unused']],
+    ]
+    return groups.flatMap(([setting, names]) =>
+      names.map((name) => `-W${setting.getValue() ? '' : 'no-'}${name}`)
+    )
+  }
+}
+
+/// Consolidates missing dependency diagnostics without altering compiler input.
 function toDiagnostics(
   entries: SlangDiagnostic[],
   root: string,
   unlocated: string,
-  mirror: TemplateMirror | undefined
+  sources: SourceDependencies,
+  readingMode: boolean,
+  project: boolean
 ): Map<string, vscode.Diagnostic[]> {
   const files = new Map<string, vscode.Diagnostic[]>()
   const seen = new Set<string>()
@@ -60,10 +116,7 @@ function toDiagnostics(
   const repeats = new Map<vscode.Diagnostic, number>()
   // end of an unknown macro -> its diagnostic
   const macroEnds = new Map<string, vscode.Diagnostic>()
-  // file -> undeclared names left out
-  const undeclared = new Map<string, number>()
-  const filePath = (file: string) =>
-    mirror === undefined ? path.resolve(root, file) : mirror.original(path.resolve(root, file))
+  const filePath = (file: string) => path.resolve(root, file)
   const parse = (entry: SlangDiagnostic): [string, vscode.Range] | undefined => {
     const match = /^(.*):(\d+):(\d+)$/.exec(entry.location ?? '')
     if (match === null) {
@@ -84,17 +137,75 @@ function toDiagnostics(
     return [filePath(match[1]), range]
   }
 
+  const missingCodes = new Set([
+    'CouldNotOpenIncludeFile',
+    'UnknownDirective',
+    'UnknownPackage',
+    'UnknownClassOrPackage',
+  ])
+  const missingFiles = new Set<string>()
+  const missingMacroEnds = new Set<string>()
+  if (readingMode) {
+    for (const entry of entries) {
+      const at = parse(entry)
+      if (at !== undefined && missingCodes.has(entry.code)) {
+        missingFiles.add(at[0])
+        if (entry.code === 'UnknownDirective') {
+          missingMacroEnds.add(`${at[0]}:${at[1].end.line}:${at[1].end.character}`)
+        }
+      }
+    }
+  }
+  const affected = missingFiles.size === 0 ? missingFiles : sources.affectedBy(missingFiles)
+  if (!project && missingFiles.size > 0) {
+    affected.add(unlocated)
+  }
+  const incomplete = new Map<
+    string,
+    {
+      range: vscode.Range
+      missing: number
+      hidden: number
+      causes: vscode.DiagnosticRelatedInformation[]
+    }
+  >()
+
   for (const entry of entries) {
     const at = parse(entry)
     const [file, range] = at ?? [unlocated, new vscode.Range(0, 0, 0, 0)]
-    if (mirror !== undefined && at !== undefined) {
-      if (mirror.inTemplate(file, range.start.line, range.start.character)) {
-        continue
+    const missing = readingMode && missingCodes.has(entry.code)
+    const dependent =
+      affected.has(file) &&
+      (entry.code === 'UndeclaredIdentifier' ||
+        entry.optionName === 'implicit-net' ||
+        (entry.code.startsWith('Expected') &&
+          missingMacroEnds.has(`${file}:${range.start.line}:${range.start.character}`)))
+    if (missing || dependent) {
+      const target = project ? file : unlocated
+      let summary = incomplete.get(target)
+      if (summary === undefined) {
+        summary = {
+          range: target === file ? range : new vscode.Range(0, 0, 0, 0),
+          missing: 0,
+          hidden: 0,
+          causes: [],
+        }
+        incomplete.set(target, summary)
       }
-      if (entry.code === 'UndeclaredIdentifier' && mirror.hasMarkup(file)) {
-        undeclared.set(file, (undeclared.get(file) ?? 0) + 1)
-        continue
+      if (missing) {
+        summary.missing++
+        if (summary.causes.length < 20) {
+          summary.causes.push(
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(vscode.Uri.file(file), range),
+              entry.message
+            )
+          )
+        }
+      } else {
+        summary.hidden++
       }
+      continue
     }
     const key = `${file}:${range.start.line}:${range.start.character}:${entry.code}:${entry.message}`
     if (seen.has(key)) {
@@ -180,14 +291,15 @@ function toDiagnostics(
   for (const [diag, count] of repeats) {
     diag.message += ` (+${count} more in this file)`
   }
-  for (const [file, count] of undeclared) {
-    const line = mirror!.firstLine(file)
+  for (const [file, summary] of incomplete) {
     const diag = new vscode.Diagnostic(
-      new vscode.Range(line, 0, line, 0),
-      `Not reported: ${count} undeclared name${count === 1 ? '' : 's'}, which the Perl template markup of this file may declare`,
+      summary.range,
+      `Incomplete dependencies: ${summary.missing + summary.hidden} diagnostic(s) hidden because includes, macros or packages are unavailable. Supply include paths and defines, or turn off verilog.lint.slang.readingMode for strict diagnostics.`,
       vscode.DiagnosticSeverity.Information
     )
     diag.source = 'slang'
+    diag.code = 'MissingDependencies'
+    diag.relatedInformation = summary.causes
     files.set(file, (files.get(file) ?? []).concat(diag))
   }
   return files
@@ -196,24 +308,60 @@ function toDiagnostics(
 export default class SlangLinter extends ToolConfig {
   enabled: ConfigObject<boolean> = new ConfigObject({
     default: true,
+    description: 'Enable slang lint diagnostics.',
+  })
+  scope = new ConfigObject<'openFiles' | 'project'>({
+    default: 'openFiles',
+    enum: ['openFiles', 'project'],
+    enumItemLabels: ['Open files', 'Entire project'],
     description:
-      'Check with slang: the whole project when `verilog.filelist` is set or a top module is selected, otherwise the current file',
+      'CLI fallback scope. Open files checks .sv/.v editor tabs with filelist include paths and macros. Entire project checks the filelist or top; without either, checks open files. Built-in slang-server always displays diagnostics only for open source tabs.',
   })
   runOnSave: ConfigObject<boolean> = new ConfigObject({
     default: true,
     description:
-      'Check when the first Verilog file opens and after saves. When off, only the Verilog: Lint command checks.',
+      'Check when files open and after saves. When off, only the Verilog: Lint command checks.',
   })
+  analysis = new ConfigObject<'local' | 'syntax' | 'full'>({
+    default: 'local',
+    enum: ['local', 'syntax', 'full'],
+    enumItemLabels: ['Local lint', 'Syntax only', 'Full elaboration'],
+    description:
+      'CLI fallback only. Local lint skips full hierarchy elaboration; syntax skips type checking and most warnings; full checks instance-dependent behavior. Built-in slang-server uses native shallow analysis regardless of this setting.',
+  })
+  readingMode = new ConfigObject<boolean>({
+    default: true,
+    description:
+      'Group missing includes/macros/packages into an information message and hide dependent undeclared-name errors. Turn off for strict diagnostics, including missing modules. Real name mistakes may also be hidden in files with incomplete dependencies.',
+  })
+  threads = new ConfigObject<number>({
+    default: 1,
+    minimum: 1,
+    type: 'integer',
+    description:
+      'Threads per slang process. One reduces peak resource use. Checks run one process at a time; additional arguments can override this with -j.',
+  })
+  reportMissingModules = new ConfigObject<boolean>({
+    default: false,
+    description:
+      'Also report unknown modules, interfaces and programs in reading mode. Strict mode always reports them. Local lint does not check the full instance hierarchy.',
+  })
+  warnings = new SlangWarnings()
   args: ConfigObject<string> = new ConfigObject({
     default: '',
     description:
-      'slang arguments, such as `-j 2`, `-Wextra`, `-Wwidth-trunc -Wport-width-trunc`, `--suppress-warnings ip/**`, `--lint-only`, `--error-limit 100` or `--top name`. The extension reads the diagnostics with `--diag-json`, so do not pass that.',
+      'CLI fallback arguments only; native server options belong in .slang/server.json. Examples: `-j 2`, `-Wextra`, `--suppress-warnings ip/**`, `--lint-only`, `--error-limit 100` or `--top name`. Appended after the checkbox options; individual warning flags override warning groups. Do not pass `--diag-json`, which the extension uses to read diagnostics.',
   })
 
   private diagnostics = vscode.languages.createDiagnosticCollection('slang')
+  private raw = new Map<string, { input: 'saved files'; diagnostics: SlangDiagnostic[] }>()
+
+  rawDiagnostics(uri: vscode.Uri): unknown {
+    return this.raw.get(uri.fsPath) ?? this.raw.get('') ?? { status: 'No CLI result received yet' }
+  }
   /// The empty key is the project; other keys are individually checked file paths.
   private runs = new Map<string, { process?: child_process.ChildProcess }>()
-  private mirrors = new Map<string, TemplateMirror>()
+  private queue: Promise<void> = Promise.resolve()
 
   constructor() {
     super('slang')
@@ -221,7 +369,7 @@ export default class SlangLinter extends ToolConfig {
 
   async activate(context: vscode.ExtensionContext): Promise<void> {
     context.subscriptions.push(this.diagnostics)
-    if (this.enabled.getValue()) {
+    if (this.enabled.getValue() && !ext.server.enabled.getValue()) {
       await this.path.checkPathNotify()
     }
   }
@@ -233,23 +381,32 @@ export default class SlangLinter extends ToolConfig {
     }
     this.runs.clear()
     this.diagnostics.clear()
+    this.raw.clear()
   }
 
-  clear(doc: vscode.TextDocument) {
-    this.runs.get(doc.uri.fsPath)?.process?.kill()
-    this.runs.delete(doc.uri.fsPath)
-    this.diagnostics.delete(doc.uri)
+  clear(uri: vscode.Uri) {
+    this.runs.get(uri.fsPath)?.process?.kill()
+    this.runs.delete(uri.fsPath)
+    this.diagnostics.delete(uri)
+    this.raw.delete(uri.fsPath)
   }
 
   async lint(doc: vscode.TextDocument | undefined): Promise<void> {
     const root = getWorkspaceFolder()
-    if (!this.enabled.getValue() || root === undefined) {
+    if (
+      !this.enabled.getValue() ||
+      root === undefined ||
+      ext.server.active ||
+      ext.server.pending ||
+      ext.slangExtensionActive()
+    ) {
       return
     }
     const project = lintsProject()
     const filelist = ext.projectFilelist
-    const target = ext.project.top?.definition?.doc.uri.fsPath ?? doc?.uri.fsPath
-    if (filelist === undefined && target === undefined) {
+    const target =
+      (project ? ext.project.top?.definition?.doc.uri.fsPath : undefined) ?? doc?.uri.fsPath
+    if (!(project && filelist !== undefined) && target === undefined) {
       return
     }
     const key = project ? '' : target!
@@ -258,50 +415,88 @@ export default class SlangLinter extends ToolConfig {
     this.runs.set(key, run)
     const current = () => this.runs.get(key) === run && this.enabled.getValue()
 
+    const previous = this.queue
+    let release!: () => void
+    this.queue = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await previous
+
     try {
-      // copies without template markup, when the files have any
-      let mirror: TemplateMirror | undefined
-      const cacheDir = ext.index.cacheDir?.fsPath
-      if (cacheDir !== undefined) {
-        let cached = this.mirrors.get(key)
-        if (cached === undefined) {
-          cached = new TemplateMirror(
-            path.join(path.dirname(cacheDir), 'template', project ? 'project' : 'files', key)
-          )
-          this.mirrors.set(key, cached)
-        }
-        const sources = filelist?.files ?? [target!]
-        const incdirs = filelist?.incdirs ?? [path.dirname(target!)]
-        if (await cached.update(sources, incdirs)) {
-          mirror = cached
-        }
-        if (!current()) {
-          return
-        }
+      if (!current()) {
+        return
       }
-      const copy = (file: string) => (mirror === undefined ? file : mirror.copyOf(file))
-      let args = ['--diag-json', '-']
-      if (filelist === undefined) {
-        args.push('+incdir+' + copy(path.dirname(target!)))
+      const sources = ext.server.dependencies
+      const cacheDir = ext.index.cacheDir?.fsPath
+      const inputFiles = project ? (filelist?.files ?? [target!]) : [target!]
+      const affected = await sources.update(inputFiles, filelist?.incdirs ?? [])
+      if (!current()) {
+        return
+      }
+      const template =
+        inputFiles.some((file) => affected.has(file)) ||
+        (doc !== undefined && hasTemplate(doc.getText()))
+      if (doc) {
+        ext.server.markSkipped(doc.uri, template)
+      }
+      if (template) {
+        if (project) {
+          this.diagnostics.clear()
+        } else {
+          this.diagnostics.delete(doc!.uri)
+        }
+        this.logger.info(
+          'Semantic check skipped: unexpanded Perl template in source or included header'
+        )
+        if (project) {
+          vscode.window.showInformationMessage(
+            'Project check skipped: unexpanded Perl templates. Use open-files scope to check ordinary sources.'
+          )
+        }
+        return
+      }
+      const extraArgs = this.args.getValue().split(/\s+/).filter(Boolean)
+      const analysis = extraArgs.includes('--parse-only')
+        ? 'syntax'
+        : extraArgs.includes('--lint-only')
+          ? 'local'
+          : this.analysis.getValue()
+      let args =
+        analysis === 'syntax'
+          ? [
+              '--parse-only',
+              '--diag-source=false',
+              '--diag-column',
+              '--diag-location',
+              '--color-diagnostics=false',
+            ]
+          : ['--diag-json', '-', ...(analysis === 'local' ? ['--lint-only'] : [])]
+      args.push('-j', String(this.threads.getValue()))
+      if (!project) {
+        for (const dir of new Set([path.dirname(target!), ...(filelist?.incdirs ?? [])])) {
+          args.push('-I', dir)
+        }
+        for (const [name, value] of filelist?.defines ?? []) {
+          args.push(`-D${name}${value === '' ? '' : '=' + value}`)
+        }
+        args.push(target!)
+      } else if (filelist === undefined) {
+        args.push('+incdir+' + path.dirname(target!))
         if (cacheDir !== undefined) {
           // links to all module files, so slang finds the modules the target uses
           args.push('-y', cacheDir)
         }
-        args.push(copy(target!))
-      } else if (mirror === undefined) {
-        args.push('-f', filelist.path)
+        args.push(target!)
       } else {
-        const copied = path.join(mirror.dir, 'filelist.f')
-        const lines = filelist.options.concat(
-          filelist.incdirs.map((dir) => `+incdir+"${mirror!.copyOf(dir)}"`),
-          filelist.files.map((file) => `"${mirror!.copyOf(file)}"`)
-        )
-        await fs.promises.writeFile(copied, lines.join('\n') + '\n')
-        args.push('-f', copied)
+        args.push('-f', filelist.path)
       }
-      args = args.concat(this.args.getValue().split(/\s+/).filter(Boolean))
+      args.push(...this.warnings.arguments())
+      if (this.readingMode.getValue() && !this.reportMissingModules.getValue()) {
+        args.push('--ignore-unknown-modules')
+      }
+      args = args.concat(extraArgs.filter((arg) => arg !== '--parse-only' && arg !== '--lint-only'))
       // the check that diagnostics without a place in the code are shown on
-      const unlocated = filelist?.path ?? target!
+      const unlocated = project ? (filelist?.path ?? target!) : target!
       const command = this.path.getValue()
       if (!current()) {
         return
@@ -326,6 +521,56 @@ export default class SlangLinter extends ToolConfig {
                 error.signal ? `stopped by ${error.signal}` : error.message.split('\n')[0]
               )
               resolve(undefined)
+            } else if (analysis === 'syntax') {
+              const parsed: SlangDiagnostic[] = Array.from(
+                err.matchAll(/^(.*):(\d+):(\d+): (error|warning|note): (.*)$/gm),
+                (match) => {
+                  const message = match[5]
+                  const macro = /unknown macro or compiler directive '(`\w+)'/.exec(message)
+                  const code = macro
+                    ? 'UnknownDirective'
+                    : /^'.*': No such file or directory$/.test(message)
+                      ? 'CouldNotOpenIncludeFile'
+                      : message.startsWith('expected ')
+                        ? 'ExpectedSyntax'
+                        : 'SyntaxDiagnostic'
+                  return {
+                    location: `${match[1]}:${match[2]}:${match[3]}`,
+                    severity: match[4],
+                    message,
+                    code,
+                    ranges: macro
+                      ? [
+                          {
+                            start: {
+                              file: match[1],
+                              line: Number(match[2]),
+                              column: Number(match[3]),
+                            },
+                            end: {
+                              file: match[1],
+                              line: Number(match[2]),
+                              column: Number(match[3]) + macro[1].length,
+                            },
+                          },
+                        ]
+                      : undefined,
+                  }
+                }
+              )
+              if (/too many errors emitted/.test(err)) {
+                parsed.push({
+                  severity: 'error',
+                  code: 'TooManyErrors',
+                  message: 'slang stopped at its error limit',
+                })
+              }
+              if (error !== null && parsed.length === 0) {
+                this.reportFailure(err.trim().split('\n')[0] || `exit code ${error.code}`)
+                resolve(undefined)
+              } else {
+                resolve(JSON.stringify(parsed))
+              }
             } else if (json === null) {
               // such as for an unknown argument
               this.reportFailure(err.trim().split('\n')[0] || `exit code ${error?.code}`)
@@ -347,7 +592,14 @@ export default class SlangLinter extends ToolConfig {
         this.reportFailure(`unreadable diagnostics: ${e}`)
         return
       }
-      const files = toDiagnostics(entries, root, unlocated, mirror)
+      const files = toDiagnostics(
+        entries,
+        root,
+        unlocated,
+        sources,
+        this.readingMode.getValue(),
+        project
+      )
       if (project && filelist === undefined && ext.index.cacheDir !== undefined) {
         // modules found through -y are reported at their links
         for (const [file, diags] of Array.from(files)) {
@@ -361,6 +613,7 @@ export default class SlangLinter extends ToolConfig {
       if (!current()) {
         return
       }
+      this.raw.set(project ? '' : doc!.uri.fsPath, { input: 'saved files', diagnostics: entries })
       if (project) {
         this.diagnostics.clear()
         for (const [file, diags] of files) {
@@ -368,8 +621,29 @@ export default class SlangLinter extends ToolConfig {
         }
         this.logger.info(`${entries.length} diagnostics in ${files.size} files`)
       } else if (doc !== undefined) {
-        // other files are reported as this file sees them, which may be wrong
-        this.diagnostics.set(doc.uri, files.get(doc.uri.fsPath) ?? [])
+        const diagnostics = files.get(doc.uri.fsPath) ?? []
+        for (const [file, included] of files) {
+          if (file !== doc.uri.fsPath) {
+            for (const diagnostic of included) {
+              const forwarded = new vscode.Diagnostic(
+                new vscode.Range(0, 0, 0, 0),
+                `${path.relative(root, file)}: ${diagnostic.message}`,
+                diagnostic.severity
+              )
+              forwarded.source = 'slang'
+              forwarded.code = diagnostic.code
+              forwarded.relatedInformation = [
+                new vscode.DiagnosticRelatedInformation(
+                  new vscode.Location(vscode.Uri.file(file), diagnostic.range),
+                  diagnostic.message
+                ),
+                ...(diagnostic.relatedInformation ?? []),
+              ]
+              diagnostics.push(forwarded)
+            }
+          }
+        }
+        this.diagnostics.set(doc.uri, diagnostics)
       }
     } catch (error) {
       if (current()) {
@@ -379,6 +653,7 @@ export default class SlangLinter extends ToolConfig {
       if (this.runs.get(key) === run) {
         this.runs.delete(key)
       }
+      release()
     }
   }
 

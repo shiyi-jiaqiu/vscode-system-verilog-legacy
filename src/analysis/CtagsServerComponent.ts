@@ -4,12 +4,7 @@ import { ext } from '../extension'
 import { resolveInclude } from '../Filelist'
 import { ExtensionComponent, PathConfigObject } from '../lib/libconfig'
 import { maskTemplate } from '../Template'
-import {
-  anyVerilogSelector,
-  getParentText,
-  getPrev2Char,
-  getPrevChar,
-} from '../utils'
+import { anyVerilogSelector, getParentText, getPrev2Char, getPrevChar } from '../utils'
 import builtins from './builtins.json'
 import { getConstValue, getMacroBody, ValueStep } from './ConstValue'
 import { Symbol, SymbolCompletionItem } from './Symbol'
@@ -103,11 +98,6 @@ export class CtagsServerComponent
   builtinHovers: Map<string, vscode.Hover> = new Map()
 
   async activate(context: vscode.ExtensionContext) {
-    // push provider subs to .v and .sv files
-    if (ext.slangExtensionActive()) {
-      this.logger.info('vscode-slang is active, skipping ctags providers')
-      return
-    }
     this.loadBuiltins()
     context.subscriptions.push(
       vscode.languages.registerDocumentSymbolProvider(anyVerilogSelector, this)
@@ -241,6 +231,10 @@ export class CtagsServerComponent
     token: vscode.CancellationToken,
     context: vscode.CompletionContext
   ): Promise<vscode.CompletionItem[]> {
+    if (ext.server.pending || ext.server.owns(document) || ext.slangExtensionActive()) {
+      return []
+    }
+
     let prevChar = getPrevChar(document, position)
     let prev2Char = getPrev2Char(document, position)
     this.logger.info(
@@ -261,6 +255,15 @@ export class CtagsServerComponent
 
     // Macro Completion
     if (context.triggerCharacter === '`') {
+      if (ext.server.active) {
+        const docs = [document, ...(await ext.index.dependencyDocuments(document))]
+        const symbols = (
+          await Promise.all(docs.map((doc) => ext.index.getVerilogDoc(doc).getSymbols({}, false)))
+        ).flat()
+        return symbols
+          .filter((symbol) => symbol.isMacro())
+          .map((symbol) => symbol.getCompletionItem())
+      }
       const macroCompletions = Array.from(ext.index.headerMacros, ([name, [kind, line]]) =>
         macroCompletionItem(name, kind, line)
       )
@@ -338,6 +341,23 @@ export class CtagsServerComponent
       symbols = symbols.filter((sym) => !(sym.type === 'block' && sym.children.length === 0))
     }
 
+    const word = document.getWordRangeAtPosition(position)
+    const prefix = word ? document.getText(new vscode.Range(word.start, position)) : ''
+    const unit = ext.index.getVerilogDoc(document).unitAt(position)
+    symbols = symbols.filter(
+      (sym) =>
+        (!prefix || sym.name.startsWith(prefix)) &&
+        (!unit ||
+          sym.doc !== document ||
+          sym.parentScope === '' ||
+          sym.parentScope.split('.')[0] === unit)
+    )
+    additionalCompletions = additionalCompletions.filter(
+      (item) =>
+        !prefix ||
+        (typeof item.label === 'string' ? item.label : item.label.label).startsWith(prefix)
+    )
+
     let items = symbols.map((symbol: Symbol) => {
       return symbol.getCompletionItem()
     })
@@ -364,7 +384,22 @@ export class CtagsServerComponent
     position: vscode.Position,
     _token: vscode.CancellationToken
   ): Promise<vscode.Hover | undefined> {
+    if (ext.server.pending || ext.server.owns(document) || ext.slangExtensionActive()) {
+      return undefined
+    }
+
     this.logger.info('Hover requested')
+
+    const offset = document.offsetAt(position)
+    const dynamic = maskTemplate(document.getText()).regions.find(
+      ([start, end]) => start <= offset && offset < end
+    )
+    if (dynamic) {
+      return new vscode.Hover(
+        'Unexpanded Perl template: generated names and values cannot be resolved. Static declarations remain available.',
+        new vscode.Range(document.positionAt(dynamic[0]), document.positionAt(dynamic[1]))
+      )
+    }
 
     // TODO: reuse this range, pass to findSymbol
     let range = document.getWordRangeAtPosition(position)
@@ -457,6 +492,10 @@ export class CtagsServerComponent
     range: vscode.Range,
     _token: vscode.CancellationToken
   ): Promise<vscode.InlayHint[]> {
+    if (ext.server.pending || ext.server.owns(document) || ext.slangExtensionActive()) {
+      return []
+    }
+
     const verilogDoc = ext.index.getVerilogDoc(document)
     const insts = (await verilogDoc.getSymbols({ type: 'instance' })).filter(
       (inst) => inst.typeRef !== null && inst.getFullRange().intersection(range) !== undefined
@@ -478,17 +517,13 @@ export class CtagsServerComponent
     const stringRegex = /("([^"]*)")/g
     while ((match = stringRegex.exec(line)) !== null) {
       // check bounds
-      if (
-        !(match.index <= position.character && position.character < match.index + match[1].length)
-      ) {
+      if (!(
+        match.index <= position.character && position.character < match.index + match[1].length
+      )) {
         continue
       }
 
-      let resolvedPath = await resolveInclude(
-        document.fileName,
-        match[2],
-        ext.projectFilelist
-      )
+      let resolvedPath = await resolveInclude(document.fileName, match[2], ext.projectFilelist)
       if (!resolvedPath) {
         continue
       }
@@ -517,6 +552,10 @@ export class CtagsServerComponent
     position: vscode.Position,
     _token: vscode.CancellationToken
   ): Promise<vscode.DefinitionLink[] | undefined> {
+    if (ext.server.pending || ext.server.owns(document) || ext.slangExtensionActive()) {
+      return undefined
+    }
+
     this.logger.info('Definitions Requested: ' + document.uri)
     const symPromise = ext.index.findSymbol(document, position)
     const includePromise = this.findIncludes(document, position)
@@ -541,6 +580,10 @@ export class CtagsServerComponent
     document: vscode.TextDocument,
     _token: vscode.CancellationToken
   ): Promise<vscode.DocumentSymbol[]> {
+    if (ext.server.pending || ext.server.owns(document) || ext.slangExtensionActive()) {
+      return []
+    }
+
     this.logger.info(`provideDocumentSymbols(${document.uri}) => ...`)
     const tree = await ext.index.getVerilogDoc(document).getSymbolTree()
     try {
@@ -565,6 +608,10 @@ export class CtagsServerComponent
     position: vscode.Position,
     _token: vscode.CancellationToken
   ): Promise<vscode.DocumentHighlight[]> {
+    if (ext.server.pending || ext.server.owns(document) || ext.slangExtensionActive()) {
+      return []
+    }
+
     const range = document.getWordRangeAtPosition(position)
     if (range === undefined) {
       return []

@@ -6,7 +6,7 @@ import { CTAGS_MAPS, maskMacroCalls, VerilogDoc } from './analysis/VerilogDoc'
 import { ext } from './extension'
 import { ExtensionComponent } from './lib/libconfig'
 import { getParentText, getPrevChar, isAnyVerilog } from './utils'
-import { maskTemplate } from './Template'
+import { hasTemplate, maskTemplate } from './Template'
 import fs = require('fs')
 import os = require('os')
 import path = require('path')
@@ -48,9 +48,28 @@ export class IndexComponent extends ExtensionComponent {
 
     // file save, rename, delete mgmt
     context.subscriptions.push(
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        if (isAnyVerilog(event.document.languageId)) {
+          const affected = ext.server.dependencies.affectedBy(new Set([event.document.uri.fsPath]))
+          for (const vdoc of this.filemap.values()) {
+            if (
+              affected.has(vdoc.doc.uri.fsPath) ||
+              vdoc.importSymbols?.some((symbol) => symbol.doc === event.document)
+            ) {
+              vdoc.importSymbols = undefined
+            }
+          }
+        }
+      }),
       vscode.workspace.onDidSaveTextDocument(async (doc: vscode.TextDocument) => {
         if (!isAnyVerilog(doc.languageId)) {
           return
+        }
+        if (ext.server.active || ext.server.pending || ext.slangExtensionActive()) {
+          return
+        }
+        for (const vdoc of this.filemap.values()) {
+          vdoc.importSymbols = undefined
         }
         this.indexFile(doc.uri)
         this.getVerilogDoc(doc).clearSymbols()
@@ -84,6 +103,16 @@ export class IndexComponent extends ExtensionComponent {
     ext.ctags.path.onConfigUpdated(async () => {
       await ext.ctags.path.checkPathNotify()
     })
+  }
+
+  releaseGlobalIndex() {
+    this.moduleMap.clear()
+    this.unitKinds.clear()
+    this.macroFiles.clear()
+    this.headerFiles.clear()
+    this.headerMacros.clear()
+    this.headers.clear()
+    this.filemap.clear()
   }
 
   async getDir(reset: boolean = false): Promise<vscode.Uri | undefined> {
@@ -170,11 +199,38 @@ export class IndexComponent extends ExtensionComponent {
     if (files.length === 0) {
       return
     }
-    const stdout = await this.ctags(
-      files.map((file) => file.fsPath),
-      '--kinds-SystemVerilog=mIKCPd --kinds-Verilog=md'
-    )
+    const temp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'verilog-names-'))
+    const inputs = files.map((file) => file.fsPath)
+    const originals = new Map<string, string>()
+    let stdout: string
+    try {
+      for (let i = 0; i < files.length; i += 16) {
+        await Promise.all(
+          files.slice(i, i + 16).map(async (file, j) => {
+            const text = await fs.promises.readFile(file.fsPath, 'utf8')
+            if (hasTemplate(text)) {
+              const copy = path.join(temp, `${i + j}${path.extname(file.fsPath)}`)
+              await fs.promises.writeFile(copy, maskTemplate(text).text)
+              inputs[i + j] = copy
+              originals.set(copy, file.fsPath)
+            }
+          })
+        )
+      }
+      stdout = await this.ctags(inputs, '--kinds-SystemVerilog=mIKCPd --kinds-Verilog=md')
+    } finally {
+      await fs.promises.rm(temp, { recursive: true, force: true })
+    }
+    if (ext.server.active || ext.server.pending || ext.slangExtensionActive()) {
+      return
+    }
     const updated = new Set(files.map((file) => file.fsPath))
+    for (const [name, uri] of this.moduleMap) {
+      if (updated.has(uri.fsPath)) {
+        this.moduleMap.delete(name)
+        this.unitKinds.delete(name)
+      }
+    }
     for (const [name, uris] of this.macroFiles) {
       this.macroFiles.set(
         name,
@@ -187,7 +243,7 @@ export class IndexComponent extends ExtensionComponent {
       if (kind === undefined) {
         continue
       }
-      const uri = vscode.Uri.file(file)
+      const uri = vscode.Uri.file(originals.get(file) ?? file)
       if (kind === 'define') {
         const uris = this.macroFiles.get(name) ?? []
         if (!uris.some((u) => u.fsPath === uri.fsPath)) {
@@ -212,7 +268,10 @@ export class IndexComponent extends ExtensionComponent {
       return local
     }
     const found: Symbol[] = []
-    for (const uri of this.macroFiles.get(name) ?? []) {
+    const candidates = ext.server.active
+      ? (await this.dependencyDocuments(document)).map((doc) => doc.uri)
+      : (this.macroFiles.get(name) ?? [])
+    for (const uri of candidates) {
       const doc = await vscode.workspace.openTextDocument(uri)
       const syms = await this.getVerilogDoc(doc).getSymbols({ name }, false)
       found.push(...syms.filter((sym) => sym.isMacro()))
@@ -260,18 +319,23 @@ export class IndexComponent extends ExtensionComponent {
             this.logger.info(`indexing ${files.length} .svh files`)
             const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'vscode-verilog-'))
             try {
-              const texts = await Promise.all(
-                files.map((file) => fs.promises.readFile(file.fsPath, 'utf-8').catch(() => ''))
-              )
-              // the extension selects the ctags parser
               const copies = files.map((file, i) => path.join(dir, i + path.extname(file.fsPath)))
-              await Promise.all(
-                copies.map((copy, i) =>
-                  fs.promises.writeFile(copy, maskMacroCalls(maskTemplate(texts[i]).text))
+              for (let i = 0; i < files.length; i += 16) {
+                await Promise.all(
+                  files.slice(i, i + 16).map(async (file, j) => {
+                    const text = await fs.promises.readFile(file.fsPath, 'utf8').catch(() => '')
+                    await fs.promises.writeFile(
+                      copies[i + j],
+                      maskMacroCalls(maskTemplate(text).text)
+                    )
+                  })
                 )
-              )
+              }
               const lines = new Map<number, string[]>()
               const tags = await this.ctags(copies)
+              if (ext.server.active || ext.server.pending || ext.slangExtensionActive()) {
+                return
+              }
               if (reset) {
                 this.headers.clear()
               }
@@ -286,7 +350,8 @@ export class IndexComponent extends ExtensionComponent {
                 }
                 const i = Number(path.basename(copy, path.extname(copy)))
                 if (!lines.has(i)) {
-                  lines.set(i, texts[i].split(/\r?\n/))
+                  lines.clear()
+                  lines.set(i, (await fs.promises.readFile(files[i].fsPath, 'utf8')).split(/\r?\n/))
                 }
                 const text = lines.get(i)![Number(line.slice(0, -2)) - 1] ?? ''
                 // ctags before 6.1 calls a `define a constant
@@ -318,9 +383,13 @@ export class IndexComponent extends ExtensionComponent {
   }
 
   /// Top level symbols named `name` in the headers
-  async findHeaderSymbols(name: string): Promise<Symbol[]> {
+  async findHeaderSymbols(name: string, document?: vscode.TextDocument): Promise<Symbol[]> {
     const found: Symbol[] = []
-    for (const uri of this.headerFiles.get(name) ?? []) {
+    const candidates =
+      ext.server.active && document
+        ? (await this.dependencyDocuments(document)).map((doc) => doc.uri)
+        : (this.headerFiles.get(name) ?? [])
+    for (const uri of candidates) {
       let doc: vscode.TextDocument
       try {
         doc = await vscode.workspace.openTextDocument(uri)
@@ -334,6 +403,28 @@ export class IndexComponent extends ExtensionComponent {
     return found
   }
 
+  /// Only the requested source's literal include closure is parsed by ctags in native mode.
+  async dependencyDocuments(document: vscode.TextDocument): Promise<vscode.TextDocument[]> {
+    await ext.server.dependencies.update(
+      [document.uri.fsPath],
+      ext.projectFilelist?.incdirs ?? [],
+      new Map(
+        vscode.workspace.textDocuments
+          .filter((doc) => doc === document || doc.isDirty)
+          .map((doc) => [doc.uri.fsPath, doc.getText()])
+      )
+    )
+    const docs: vscode.TextDocument[] = []
+    for (const file of ext.server.dependencies.dependenciesOf(document.uri.fsPath)) {
+      try {
+        docs.push(await vscode.workspace.openTextDocument(file))
+      } catch {
+        /* removed meanwhile */
+      }
+    }
+    return docs
+  }
+
   getVerilogDoc(doc: vscode.TextDocument): VerilogDoc {
     let vdoc: VerilogDoc | undefined = this.filemap.get(doc)
     if (vdoc === undefined) {
@@ -345,6 +436,9 @@ export class IndexComponent extends ExtensionComponent {
 
   async findFile(moduleName: string): Promise<vscode.TextDocument | undefined> {
     let file = this.moduleMap.get(moduleName)
+    if (file === undefined && ext.server.active) {
+      file = await ext.server.findUnit(moduleName)
+    }
     if (file === undefined) {
       return undefined
     }
@@ -418,7 +512,11 @@ export class IndexComponent extends ExtensionComponent {
       }
     }
 
-    if (this.moduleMap.has(targetText) || this.moduleMap.has(parentScope)) {
+    if (
+      (ext.server.active && parentScope !== targetText) ||
+      this.moduleMap.has(targetText) ||
+      this.moduleMap.has(parentScope)
+    ) {
       // find parentScope.sv of parentScope::targetText
       let sym = (await this.findDefinitionByName(parentScope, targetText)).at(0)
       // Sometimes package::x is found multiple times, return just the top level package
@@ -432,6 +530,12 @@ export class IndexComponent extends ExtensionComponent {
     if (local.length > 0) {
       return local
     }
-    return (await this.findHeaderSymbols(targetText)).filter((sym) => !sym.isMacro())
+    if (ext.server.active) {
+      const unit = await this.findModuleSymbol(targetText)
+      if (unit) {
+        return [unit]
+      }
+    }
+    return (await this.findHeaderSymbols(targetText, document)).filter((sym) => !sym.isMacro())
   }
 }

@@ -204,6 +204,23 @@ export class InactiveRegionsComponent extends ExtensionComponent {
   private decorationType = vscode.window.createTextEditorDecorationType({ opacity: '0.5' })
   private enabled = false
   private pending = new Map<vscode.TextDocument, NodeJS.Timeout>()
+  private native = new Map<string, { version: number; ranges: vscode.Range[] }>()
+
+  setNative(uri: string, version: number | undefined, ranges: vscode.Range[]) {
+    if (version !== undefined) {
+      this.native.set(uri, { version, ranges })
+      this.update()
+    }
+  }
+
+  clearNative(uri?: string) {
+    if (uri === undefined) {
+      this.native.clear()
+    } else {
+      this.native.delete(uri)
+    }
+    this.update()
+  }
 
   async activate(context: vscode.ExtensionContext): Promise<void> {
     if (ext.slangExtensionActive()) {
@@ -238,8 +255,24 @@ export class InactiveRegionsComponent extends ExtensionComponent {
   }
 
   private updateEditor(editor: vscode.TextEditor) {
+    if (ext.server.active) {
+      const result = this.native.get(editor.document.uri.toString())
+      editor.setDecorations(
+        this.decorationType,
+        ext.server.owns(editor.document) && result?.version === editor.document.version
+          ? result.ranges
+          : []
+      )
+      return
+    }
     const filelist = ext.projectFilelist
-    if (filelist === undefined || !isAnyVerilog(editor.document.languageId)) {
+    if (
+      ext.server.active ||
+      ext.server.pending ||
+      ext.server.isSkipped(editor.document) ||
+      filelist === undefined ||
+      !isAnyVerilog(editor.document.languageId)
+    ) {
       editor.setDecorations(this.decorationType, [])
       return
     }

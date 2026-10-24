@@ -79,6 +79,7 @@ export class VerilogDoc {
   private logger: Logger
   private parsing: Promise<void> | undefined
   private parsedVersion = -1
+  private importsComplete = true
 
   constructor(logger: Logger, document: vscode.TextDocument) {
     this.symbols = []
@@ -115,7 +116,11 @@ export class VerilogDoc {
     }
     if (addImports) {
       if (this.importSymbols === undefined) {
-        this.importSymbols = await this.parseImports()
+        const imports = await this.parseImports()
+        // Native metadata can still be indexing on the first outline / hover request.
+        // Retry unresolved imports on demand instead of caching a permanent miss.
+        this.importSymbols = this.importsComplete ? imports : undefined
+        return filterSymbols(this.symbols.concat(imports), filter)
       }
       return filterSymbols(this.symbols.concat(this.importSymbols), filter)
     }
@@ -123,27 +128,30 @@ export class VerilogDoc {
   }
 
   async parseImports(): Promise<Symbol[]> {
+    this.importsComplete = true
     // search for import pkg::*;
     let importedFiles: vscode.Uri[] = []
     const importRe = /[^\w]import ([^:]+)::\*;/g
-    const text = this.doc.getText()
+    const text = maskTemplate(this.doc.getText()).text
     let match
     while ((match = importRe.exec(text)) !== null) {
-      const uri = ext.index.moduleMap.get(match[1])
-      if (uri !== undefined) {
-        importedFiles.push(uri)
+      const doc = await ext.index.findFile(match[1])
+      if (doc !== undefined) {
+        importedFiles.push(doc.uri)
+      } else {
+        this.importsComplete = false
       }
     }
 
-    // TODO: maybe do includes? The thing is includes are recommended to be preindexed (svh),
-    // so the parsing here would not really be needed
-    // const includeRe = new RegExp(/^\s*`include "([^"]+)"/g)
+    if (ext.server.active) {
+      importedFiles.push(...(await ext.index.dependencyDocuments(this.doc)).map((doc) => doc.uri))
+    }
 
     // parse each import in parallel
     const symbols: Promise<Symbol[]>[] = importedFiles.map(async (uri) => {
       let doc = await vscode.workspace.openTextDocument(uri)
       const ctags = ext.index.getVerilogDoc(doc)
-      return ctags.getSymbols()
+      return ctags.getSymbols({}, false)
     })
 
     return (await Promise.all(symbols)).reduce((acc, curr) => acc.concat(curr), [])

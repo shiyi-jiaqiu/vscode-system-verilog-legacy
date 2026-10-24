@@ -2,7 +2,7 @@
   "name": "verilog-systemverilog-legacy",
   "displayName": "Verilog/SystemVerilog Legacy",
   "description": "Ctags-based Verilog/SystemVerilog indexing, hovers with parameter and macro values, semantic highlighting and project linting, for VS Code 1.84",
-  "version": "0.4.2",
+  "version": "0.6.0",
   "publisher": "local",
   "keywords": [
     "verilog",
@@ -20,7 +20,7 @@
     "url": "https://github.com/shiyi-jiaqiu/vscode-system-verilog-legacy/issues"
   },
   "engines": {
-    "vscode": "^1.75.0"
+    "vscode": "^1.84.0"
   },
   "categories": [
     "Programming Languages",
@@ -315,7 +315,7 @@
         },
         "verilog.filelist": {
           "default": "",
-          "description": "Project filelist relative to the workspace root. Its source files are indexed, +incdir+/-I directories are searched for includes, +define+/-D macros select the active `ifdef branches, and linters get it with -f instead of the current file. Run Reindex after editing it.",
+          "description": "Project filelist relative to the workspace root. Its sources are indexed, include paths and macros are used by lint and indexing, and changes reload automatically. Set verilog.lint.slang.scope to project to lint all sources.",
           "type": "string"
         },
         "verilog.moduleGlobs": {
@@ -343,9 +343,19 @@
           "description": "Without `verilog.filelist`: glob of the files the other globs leave out",
           "type": "string"
         },
+        "verilog.server.enabled": {
+          "default": true,
+          "description": "Use slang-server for standard Verilog navigation and diagnostics when available. Falls back to ctags and slang CLI if unavailable. Perl templates use static browsing only.",
+          "type": "boolean"
+        },
+        "verilog.server.path": {
+          "default": "",
+          "description": "Path to slang-server. Empty searches PATH and the directory containing the configured slang executable. Requires a binary compatible with this operating system.",
+          "type": "string"
+        },
         "verilog.lint.slang.args": {
           "default": "",
-          "description": "slang arguments, such as `-j 2`, `-Wextra`, `-Wwidth-trunc -Wport-width-trunc`, `--suppress-warnings ip/**`, `--lint-only`, `--error-limit 100` or `--top name`. The extension reads the diagnostics with `--diag-json`, so do not pass that.",
+          "description": "CLI fallback arguments only; native server options belong in .slang/server.json. Examples: `-j 2`, `-Wextra`, `--suppress-warnings ip/**`, `--lint-only`, `--error-limit 100` or `--top name`. Appended after the checkbox options; individual warning flags override warning groups. Do not pass `--diag-json`, which the extension uses to read diagnostics.",
           "type": "string"
         },
         "verilog.lint.slang.path": {
@@ -355,12 +365,91 @@
         },
         "verilog.lint.slang.enabled": {
           "default": true,
-          "description": "Check with slang: the whole project when `verilog.filelist` is set or a top module is selected, otherwise the current file",
+          "description": "Enable slang lint diagnostics.",
           "type": "boolean"
+        },
+        "verilog.lint.slang.scope": {
+          "default": "openFiles",
+          "enum": [
+            "openFiles",
+            "project"
+          ],
+          "enumItemLabels": [
+            "Open files",
+            "Entire project"
+          ],
+          "description": "CLI fallback scope. Open files checks .sv/.v editor tabs with filelist include paths and macros. Entire project checks the filelist or top; without either, checks open files. Built-in slang-server always displays diagnostics only for open source tabs.",
+          "type": "string"
         },
         "verilog.lint.slang.runOnSave": {
           "default": true,
-          "description": "Check when the first Verilog file opens and after saves. When off, only the Verilog: Lint command checks.",
+          "description": "Check when files open and after saves. When off, only the Verilog: Lint command checks.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.analysis": {
+          "default": "local",
+          "enum": [
+            "local",
+            "syntax",
+            "full"
+          ],
+          "enumItemLabels": [
+            "Local lint",
+            "Syntax only",
+            "Full elaboration"
+          ],
+          "description": "CLI fallback only. Local lint skips full hierarchy elaboration; syntax skips type checking and most warnings; full checks instance-dependent behavior. Built-in slang-server uses native shallow analysis regardless of this setting.",
+          "type": "string"
+        },
+        "verilog.lint.slang.readingMode": {
+          "default": true,
+          "description": "Group missing includes/macros/packages into an information message and hide dependent undeclared-name errors. Turn off for strict diagnostics, including missing modules. Real name mistakes may also be hidden in files with incomplete dependencies.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.threads": {
+          "default": 1,
+          "minimum": 1,
+          "type": "integer",
+          "description": "Threads per slang process. One reduces peak resource use. Checks run one process at a time; additional arguments can override this with -j."
+        },
+        "verilog.lint.slang.reportMissingModules": {
+          "default": false,
+          "description": "Also report unknown modules, interfaces and programs in reading mode. Strict mode always reports them. Local lint does not check the full instance hierarchy.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.widthTruncation": {
+          "default": true,
+          "description": "Report expression/port width truncation and lossy constant conversions.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.widthExpansion": {
+          "default": false,
+          "description": "Report implicit expression/port width expansion.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.signedness": {
+          "default": false,
+          "description": "Report implicit signedness conversions and comparisons of differently signed values.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.portConnections": {
+          "default": true,
+          "description": "Report unconnected ports and explicitly empty input/inout connections.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.implicitNets": {
+          "default": true,
+          "description": "Report implicitly declared wires, which can indicate misspelled signal names.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.caseStatements": {
+          "default": true,
+          "description": "Report missing case defaults, duplicate/overlapping items and incomplete coverage.",
+          "type": "boolean"
+        },
+        "verilog.lint.slang.warnings.unused": {
+          "default": false,
+          "description": "Report unused or undriven signals, ports, parameters and other declarations.",
           "type": "boolean"
         },
         "verilog.format.args": {
@@ -376,6 +465,18 @@
       }
     },
     "commands": [
+      {
+        "command": "verilog.server.configureIndex",
+        "title": "Verilog: Configure Native Index"
+      },
+      {
+        "command": "verilog.server.autoConfigure",
+        "title": "Verilog: Auto-configure Native Index and Includes"
+      },
+      {
+        "command": "verilog.server.showDiagnostics",
+        "title": "Verilog: Show Raw Diagnostics"
+      },
       {
         "command": "verilog.lint.run",
         "title": "Verilog: Lint"
@@ -587,7 +688,7 @@
     "watch-tests": "tsc -p . -w --outDir out",
     "lint": "eslint src --ext ts",
     "vscode:prepublish": "npm run esbuild-base -- --minify",
-    "esbuild-base": "esbuild ./src/extension.ts --bundle --external:vscode --format=cjs --platform=node --outfile=dist/main.js",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --external:vscode --format=cjs --platform=node --outfile=dist/main.js --alias:jsonc-parser=jsonc-parser/lib/esm/main.js",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild -- --watch",
     "format": "npx prettier --write **/*.ts",
@@ -603,7 +704,9 @@
   "dependencies": {
     "@types/deep-diff": "^1.0.5",
     "js-yaml": "^4.1.0",
+    "jsonc-parser": "3.2.1",
     "semver": "^7.6.0",
+    "vscode-languageclient": "9.0.1",
     "which": "^4.0.0"
   },
   "devDependencies": {

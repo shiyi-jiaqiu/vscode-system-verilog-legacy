@@ -4,7 +4,7 @@ import { Symbol } from './analysis/Symbol'
 import { ext } from './extension'
 import { ExtensionComponent } from './lib/libconfig'
 import { maskTemplate } from './Template'
-import { anyVerilogSelector } from './utils'
+import { anyVerilogSelector, isAnyVerilog } from './utils'
 
 // `port` and `instance` are declared in package.json with parameter/variable as super types
 const legend = new vscode.SemanticTokensLegend(
@@ -72,6 +72,11 @@ export class SemanticTokensComponent
   extends ExtensionComponent
   implements vscode.DocumentSemanticTokensProvider
 {
+  private cache = new WeakMap<
+    vscode.TextDocument,
+    { version: number; epoch: number; tokens: vscode.SemanticTokens }
+  >()
+  private epoch = 0
   private changed = new vscode.EventEmitter<void>()
   readonly onDidChangeSemanticTokens = this.changed.event
 
@@ -79,11 +84,16 @@ export class SemanticTokensComponent
     context.subscriptions.push(
       vscode.languages.registerDocumentSemanticTokensProvider(anyVerilogSelector, this, legend),
       // symbols are rebuilt on save
-      vscode.workspace.onDidSaveTextDocument(() => this.refresh())
+      vscode.workspace.onDidSaveTextDocument((doc) => {
+        if (isAnyVerilog(doc.languageId)) {
+          this.refresh()
+        }
+      })
     )
   }
 
   refresh() {
+    this.epoch++
     this.changed.fire()
   }
 
@@ -91,6 +101,20 @@ export class SemanticTokensComponent
     document: vscode.TextDocument,
     token: vscode.CancellationToken
   ): Promise<vscode.SemanticTokens> {
+    if (
+      token.isCancellationRequested ||
+      ext.server.owns(document) ||
+      ext.server.pending ||
+      ext.slangExtensionActive()
+    ) {
+      return new vscode.SemanticTokens(new Uint32Array())
+    }
+    const cached = this.cache.get(document)
+    if (cached?.version === document.version && cached.epoch === this.epoch) {
+      return cached.tokens
+    }
+    const version = document.version
+    const epoch = this.epoch
     const vdoc = ext.index.getVerilogDoc(document)
     const imported = await vdoc.getSymbols()
     const own = vdoc.symbols

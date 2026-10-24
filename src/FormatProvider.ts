@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 import * as child_process from 'child_process'
 import * as vscode from 'vscode'
+import { ext } from './extension'
 import { ConfigObject } from './lib/libconfig'
+import { hasTemplate } from './Template'
 import { ToolConfig } from './lib/runner'
 import { anyVerilogSelector, getWorkspaceFolder } from './utils'
 
@@ -28,6 +30,10 @@ export class FormatProvider extends ToolConfig implements vscode.DocumentFormatt
     _options: vscode.FormattingOptions,
     token: vscode.CancellationToken
   ): Promise<vscode.TextEdit[]> {
+    if (hasTemplate(document.getText()) || ext.server.isSkipped(document)) {
+      vscode.window.showInformationMessage('Formatting skipped for unexpanded Perl templates.')
+      return []
+    }
     const command = this.path.getValue()
     // an empty setting must not become an empty file argument
     const args = this.args.getValue().split(/\s+/).filter(Boolean).concat('-')

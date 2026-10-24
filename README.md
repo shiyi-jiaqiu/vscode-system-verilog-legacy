@@ -1,14 +1,14 @@
 # Verilog/SystemVerilog Legacy
 
-This fork of the [AndrewNolte Verilog/SystemVerilog extension](https://github.com/AndrewNolte/vscode-system-verilog) targets VS Code 1.84 on servers without a semantic language server. It keeps the upstream TextMate grammars, snippets, Ctags index and hierarchy view, checks code with slang, formats it with Verible, and adds:
+This fork of the [AndrewNolte Verilog/SystemVerilog extension](https://github.com/AndrewNolte/vscode-system-verilog) targets VS Code 1.84, including CentOS 7 / glibc 2.17 hosts. An integrated client uses [slang-server](https://github.com/hudson-trading/slang-server) for standard Verilog and SystemVerilog; Ctags and the slang CLI provide a fallback when the server is unavailable. The fallback keeps the upstream TextMate grammars, snippets, Ctags index and hierarchy view, checks code with slang, formats it with Verible, and adds:
 
 - **Hovers** show the declaration, the default value of parameters and object-like macros computed through other parameters, macros, imported packages and `pkg::` references (`= 2048 (0x800)`), the comment above or after the declaration, related parameters, and a link to the file and line.
 - **Go to definition** looks in the enclosing module first, then the rest of the file, then imported packages, so a port such as `clk_i` resolves to one place. Modules, interfaces and packages are found by name even when the file is named differently.
 - **Macros** from `.svh`, `.vh` and other source files are indexed, so `` `NAME `` hovers and jumps to its `` `define ``. The hover of a macro, or of a parameter set from one, lists the macros and parameters its value goes through with their values and places, down to the number or to the name that is not defined. A macro is read where it is used, so a parameter name in its text is looked up in the module of the hover.
 - **Semantic highlighting** colors parameters, ports, signals, instances, types, modules and functions by what the index says they are.
-- **Filelist** support: `verilog.filelist` names the files to index (its sources and the headers in its `+incdir+`/`-I` directories, instead of the workspace globs), the directories for include lookup, the `+define+`/`-D` macros that select the active `` `ifdef `` branches, and is passed to slang with `-f`. Changes to the filelist file are picked up as by Reindex.
-- **Project lint**: with a filelist, slang checks the project once when the first editor opens and after saves (one check for Save All), stopping a check still running; switching editors does not check again. An undefined macro, missing include or unknown module is reported at its first use in each file, with the other uses and the parse errors its missing text causes listed under it. When slang stops at its error limit (20 by default), the filelist shows that later files were not checked.
-- **Perl templates**: Verilog with `<perl>...</perl>` blocks of Perl code and `<pl>...</pl>` Perl expressions is checked without running Perl. Slang reads copies, kept in the extension's storage, where the markup and the Verilog inside Perl loops and ifs (over any number of blocks) are blanked out, with lines and columns unchanged; markup within a line of Verilog becomes a placeholder name. What slang reports about the markup or right after it is dropped, and so are undeclared names in a file with markup, which the markup may declare; their number is shown at the first markup. The index, hovers and highlighting skip the markup, and the editor colors it as Perl.
+- **Filelist** support: `verilog.filelist` names the files to index (its sources and the headers in its `+incdir+`/`-I` directories, instead of the workspace globs), the directories for include lookup, the `+define+`/`-D` macros that select the active `` `ifdef `` branches, and supplies the lint include paths and macros. In project lint mode, it is passed to slang with `-f`. Nested `-f` / `-F` lists, quoted paths, comments and `$VAR` / `${VAR}` / `$(VAR)` expansion from the extension host environment are supported. `-f` retains the current directory; `-F` resolves paths relative to that list. Nested lists are watched too; malformed lists retain the last valid configuration and report an error.
+- **Lint** defaults to the `.sv` and `.v` files in open editor tabs. Opening or saving a file checks that file; switching tabs does not repeat the check, and closing the last tab for a file clears its diagnostics. Saving a header rechecks affected open sources. Checks run one process at a time, with one slang thread by default. Set `verilog.lint.slang.scope` to `project` to check the full filelist or selected top, with one check after Save All. Missing definitions are grouped at their first use in each file. If slang reaches its error limit, a diagnostic explains that checking stopped.
+- **Perl templates**: `<perl>` / `<pl>` markup is colored as Perl. A source containing unexpanded templates, or literally including a header containing them, uses static browsing only. Semantic checks and formatting are skipped; the language status explains why. The browsing index hides markup and adjacent name fragments, so `sig_<pl>$i</pl>` does not invent a declaration named `sig_`. No Perl interpreter, generator or simulation build is run. Static declarations in conditional/template regions are best-effort source locations, not proof of generated hardware. CLI project checks are skipped if any input contains a template; open-files scope still checks ordinary sources.
 - **Uses of a signal** in its module are highlighted under the cursor, assignments and declarations as writes, skipping comments, strings and `.port(` names; F7 and Shift+F7 go to the next and previous use.
 
 Values are computed lexically from defaults; parameter overrides at instantiations are not applied. Expressions involving based literals, packed or unsigned declarations, or integer overflow are left unevaluated instead of displaying a value without the required SystemVerilog sizing rules. Ctags runs on the editor text with macro calls blanked out, so a macro inside a port or parameter list no longer hides the rest of the list. A module whose name is itself a macro is not indexed.
@@ -16,12 +16,30 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.4.2.vsix
+code --install-extension verilog-systemverilog-legacy-0.6.0.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.
 
-## Configure
+## Language engine
+
+`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The offline kit includes a binary built against glibc 2.17. The VSIX embeds the client, so the upstream VS Code extension is not required. Version 0.6.0 uses the bundled `0.3.1+60857ce-legacy0.6.0` server, based on upstream commit `60857ce` with the [included compatibility patch](native/README.md). Upgrade both the VSIX and the server binary. The pair is checked with VS Code 1.84.2 in a CentOS 7 userspace.
+
+The native engine provides semantic hovers, definitions, completion, references, rename, workspace symbols and call hierarchy using shallow analysis. It indexes source metadata across the workspace and analyzes open files with referenced design units. It does not run make or a simulator as part of this extension's setup. Existing native server configurations remain in effect.
+
+Diagnostics are displayed only for open `.sv` / `.v` editor tabs and only when their server version matches the current document. Manual **Verilog: Lint** shows a waiting status until the current result arrives. **Verilog: Show Raw Diagnostics** opens the unfiltered result, including errors hidden by reading mode. An older server without versioned diagnostics can still provide navigation, but its Problems are hidden and the language status explains that the bundled server is required. The lint enable checkbox, run-on-save/manual mode, warning checkboxes, reading mode and indexing thread count also control this engine. Inactive branches are dimmed from the native preprocessor result, including macros from headers. Syntax highlighting remains active; the Ctags semantic-token provider and global Ctags index are disabled while the native server owns standard files. The built-in client does not include the upstream hierarchy sidebar; its document outline, call hierarchy and references are available through VS Code.
+
+The extension writes filelist include paths and macros to `.slang/local/verilog-editor.f`, referenced by `.slang/local/server.json`. Warning checkboxes use its `diagnosticWarnings` field; the thread setting updates `indexingThreads`. Other local JSON fields, flags, comments and trailing commas are preserved. Invalid JSON is reported without overwriting it.
+
+**Verilog: Configure Native Index** opens `.slang/server.json`. If absent, it creates an editable `index` entry from filelist source directories (or the workspace root). Existing configurations are opened unchanged. Edit `dirs` and `excludeDirs` there; exclusions accept directory names or `./relative/paths`, not wildcards. **Verilog: Auto-configure Native Index and Includes** invokes the upstream server's discovery command and opens the resulting configuration. Native workspace, user and local index entries combine. Directory indexing includes sources absent from the filelist; it is not an exact source whitelist.
+
+Warning, reading-mode, thread-count and filelist updates reload the server configuration without restarting its process. Rapid settings changes are combined, and unchanged generated files are left alone. Display controls only filter cached diagnostics. Warning toggles reuse parsed analysis, compiler flag changes rebuild analysis without a metadata scan, and changes to index roots/exclusions/environment/thread count restart indexing. Edits to included `.sv`/`.v` files and headers update affected open sources, including multiple files changed together. If the server exits, navigation, highlighting and the hierarchy sidebar return to the Ctags fallback; **Verilog: Reindex** retries the native server.
+
+`verilog.lint.slang.analysis`, `.scope`, `.args`, and `.path` configure the **CLI fallback only**. Native slang-server always uses its shallow analysis and its own configuration. To use full project CLI checks, switch off `verilog.server.enabled`. Templates retain an on-demand static include and package index for cross-file definitions, macros and completion. Editing a related open document invalidates its dependent cache. Dynamic names inside Perl markup have an explicit unresolved hover. Ordinary files continue to use native semantic values and types.
+
+The language status shows the active engine or a startup failure. The integrated server currently supports a single-folder workspace.
+
+## Configure the CLI fallback
 
 For a single-folder workspace, `scripts/hdl-setup` (Python 2.7 or 3) writes an initial `.vscode/hdl.f` and sets the extension's settings while keeping unrelated ones. The filelist lists the `.v`, `.vl` and `.sv` files with packages first, leaves out files that other files `` `include ``, and adds the `-I` directories those `` `include `` lines need; includes it cannot find in the workspace are printed. Slang arguments go after `--`:
 
@@ -37,13 +55,30 @@ The resulting settings, which can also be written by hand:
   "verilog.ctags.path": "ctags",
   "verilog.lint.slang.enabled": true,
   "verilog.lint.slang.path": "slang",
+  "verilog.lint.slang.scope": "project",
   "verilog.lint.slang.args": "--top my_top -Wextra"
 }
 ```
 
-Review the generated filelist for the real source selection and macros, then run **Verilog: Reindex**, which also checks the project again. Reindex again after editing the filelist. Without a filelist, the files matching `verilog.moduleGlobs` and `verilog.includeGlobs` (all `**/*.{sv,v}` and `**/*.{svh,vh}` files by default) are indexed and slang checks the current file. The full list of settings is in [CONFIG.md](CONFIG.md).
+Review the generated filelist for source selection and macros. Filelist changes reload automatically; **Verilog: Reindex** also refreshes the index and lint. Without a filelist, the workspace globs select the files to index. The full list of settings is in [CONFIG.md](CONFIG.md).
 
-Slang checks are chosen with `verilog.lint.slang.args`, for example `-Wwidth-trunc -Wport-width-trunc` for truncating assignments and port connections (not reported by default), `-Wextra` for more warnings, `-Wno-<name>` to turn one off, `--suppress-warnings ip/**` for third-party code, `--error-limit 0` for no error limit, and on a slow or shared server `-j 2` to limit threads or `--lint-only` to skip elaborating the hierarchy (which misses errors across instances). With `verilog.lint.slang.runOnSave` off, only **Verilog: Lint** checks.
+Open Settings and search `verilog.lint.slang`. Choose **User** for global defaults or **Workspace** to save project choices in `.vscode/settings.json`. The scope dropdown defaults to `openFiles`; choose `project` when dependencies in other source files need to be compiled together. Open-file mode takes only include paths and macros from the filelist; other filelist options apply in project mode.
+
+The checkboxes follow [slang's warning options](https://www.sv-lang.com/warning-ref.html): width truncation (including lossy constants), port connections, implicit nets, and case checks are on by default. Width expansion, signedness, unused declarations and missing modules are off. Reading mode is on by default: missing includes/macros/packages and dependent undeclared-name diagnostics become one information message per affected file. Nested includes propagate this dependency context to their includers. Real name mistakes can also be hidden in an affected file. Turn off `verilog.lint.slang.readingMode` for strict dependency diagnostics, including missing modules. Unrelated syntax errors and name errors in dependency-complete files remain visible.
+
+`verilog.lint.slang.analysis` chooses the cost and coverage: `local` (default) runs `--lint-only`, skipping full hierarchy elaboration; `syntax` runs `--parse-only` without type checking; `full` checks instance-dependent behavior. Most warning checkboxes require local or full analysis; port connections and other hierarchy-dependent checks need full analysis. `verilog.lint.slang.threads` defaults to 1; increasing it can trade memory and CPU use for speed on larger projects.
+
+For external files and build-time macros, put the actual paths and values from the build configuration in the filelist, for example:
+
+```text
++incdir+/path/to/shared/include
++define+FEATURE_ENABLED+DATA_WIDTH=32
+rtl/top.sv
+```
+
+Reading mode reduces noise when those dependencies are unavailable; it cannot reconstruct their types or values. The compiler error limit still applies, and a diagnostic says when it prevented further checking.
+
+`verilog.lint.slang.args` accepts additional flags such as `-j 2`, `-Wextra`, `--suppress-warnings ip/**` and `--error-limit 100`. Arguments follow the checkbox flags; slang gives individual warning flags precedence over groups, so `-Wextra` does not re-enable an individually disabled checkbox warning. Remove conflicting explicit flags when using a checkbox. With `verilog.lint.slang.runOnSave` off, **Verilog: Lint** manually checks the selected scope.
 
 Formatting uses `verilog.format.path` and `verilog.format.args`; to format on save, turn on `editor.formatOnSave` for the `verilog` and `systemverilog` languages. To save work on a slow server, turn off `editor.semanticHighlighting.enabled` or `editor.inlayHints.enabled` for those languages.
 
@@ -55,6 +90,6 @@ Themes decide the colors of semantic tokens. Ports and instances use their own t
 }
 ```
 
-## With vscode-slang
+## With the separate vscode-slang extension
 
-When the [vscode-slang](https://github.com/hudson-trading/slang-server) extension is installed, this extension leaves hovers, definitions, completions, diagnostics, the hierarchy views and the language client to it and only adds semantic highlighting.
+When the [vscode-slang](https://github.com/hudson-trading/slang-server) extension is installed, this extension leaves hovers, definitions, completions, diagnostics, the hierarchy views and the language client to it and disables its built-in server, CLI checks and Ctags providers. TextMate grammars and snippets remain available. This is coexistence mode; installation of that extension does not confirm that its server is running. Its settings and template handling belong to that extension.
