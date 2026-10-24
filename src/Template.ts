@@ -15,7 +15,8 @@ export type Regions = [number, number][]
 /// Follows the `{ }` of the Perl code of one block. `open` holds, for each brace still open from
 /// this or earlier blocks, whether it is a hash subscript such as `$h{key}`.
 function followBraces(code: string, open: boolean[]) {
-  const re = /#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}]/g
+  // `$#array` is the last index of an array, not a comment
+  const re = /(?<!\$)#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}]/g
   let match: RegExpExecArray | null
   while ((match = re.exec(code)) !== null) {
     if (match[0] === '{') {

@@ -16,7 +16,7 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.4.0.vsix
+code --install-extension verilog-systemverilog-legacy-0.4.1.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.
