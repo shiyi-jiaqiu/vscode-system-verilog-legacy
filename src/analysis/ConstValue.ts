@@ -52,6 +52,14 @@ export function getDeclValueText(sym: Symbol): string | undefined {
   return value === '' ? undefined : value
 }
 
+function getIntegerValueText(sym: Symbol): string | undefined {
+  const before = sym.doc.lineAt(sym.line).text.slice(0, sym.getIdRange().start.character)
+  // Packed dimensions, unsigned types and inherited declaration types need SV sizing rules.
+  return /\b(?:localparam|parameter)\s+(?:(?:int|integer)\s+)?$/.test(before)
+    ? getDeclValueText(sym)
+    : undefined
+}
+
 /// Body of an object-like `define; undefined for macros with arguments.
 export function getMacroBody(sym: Symbol): string | undefined {
   const text = sym.doc.getText(sym.getFullRange())
@@ -155,9 +163,8 @@ async function substitute(
       step.sym = sym
       step.text = sym && getDeclValueText(sym)
       // a parameter's value is read where it is declared
-      value =
-        step.text &&
-        (await substitute(step.text, sym!, depth + 1, undefined, recorded ? [] : steps))
+      const text = sym && getIntegerValueText(sym)
+      value = text && (await substitute(text, sym!, depth + 1, undefined, recorded ? [] : steps))
     }
     step.value = value === undefined ? undefined : evalConst(value)
     failed = failed || value === undefined
@@ -178,7 +185,7 @@ export async function getConstValue(
     const body = getMacroBody(sym)
     expr = body && (await substitute(body, sym, 0, site, steps))
   } else if (sym.isConstant()) {
-    const text = getDeclValueText(sym)
+    const text = getIntegerValueText(sym)
     expr = text && (await substitute(text, sym, 0, undefined, steps))
   }
   return expr === undefined ? undefined : evalConst(expr)
@@ -295,8 +302,19 @@ function clog2(v: bigint): bigint {
   return n
 }
 
-/// Evaluates an integer constant expression; undefined if it uses anything else.
+function integer(value: bigint): bigint {
+  if (value < -2147483648n || value > 2147483647n) {
+    throw new Error('integer sizing required')
+  }
+  return value
+}
+
+/// Evaluates integer expressions whose result does not depend on SV sizing or overflow.
 export function evalConst(expr: string): bigint | undefined {
+  // BigInt alone cannot preserve the width and signedness of based literals.
+  if (expr.includes("'")) {
+    return undefined
+  }
   const tokens = tokenize(expr)
   if (tokens === undefined || tokens.length === 0) {
     return undefined
@@ -312,7 +330,7 @@ export function evalConst(expr: string): bigint | undefined {
   const primary = (): bigint => {
     const t = tokens[pos++]
     if (typeof t === 'bigint') {
-      return t
+      return integer(t)
     }
     if (t === '(') {
       const v = ternary()
@@ -333,7 +351,7 @@ export function evalConst(expr: string): bigint | undefined {
     if (t === '-' || t === '+' || t === '!' || t === '~') {
       pos++
       const v = unary()
-      return t === '-' ? -v : t === '+' ? v : t === '!' ? BigInt(v === 0n) : ~v
+      return integer(t === '-' ? -v : t === '+' ? v : t === '!' ? BigInt(v === 0n) : ~v)
     }
     return power()
   }
@@ -343,10 +361,10 @@ export function evalConst(expr: string): bigint | undefined {
     if (peek() === '**') {
       pos++
       const exp = unary()
-      if (exp < 0n) {
-        throw new Error('negative exponent')
+      if (exp < 0n || exp > 31n) {
+        throw new Error('exponent requires sizing')
       }
-      return base ** exp
+      return integer(base ** exp)
     }
     return base
   }
@@ -362,7 +380,13 @@ export function evalConst(expr: string): bigint | undefined {
       if ((op === '/' || op === '%') && rhs === 0n) {
         throw new Error('division by zero')
       }
-      v = binary(op, v, rhs)
+      if (
+        ['<<', '>>', '<<<', '>>>'].includes(op) &&
+        (rhs < 0n || rhs > 31n || (op === '>>' && v < 0n))
+      ) {
+        throw new Error('shift requires sizing')
+      }
+      v = integer(binary(op, v, rhs))
     }
     return v
   }

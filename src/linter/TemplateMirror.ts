@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 import * as fs from 'fs'
 import * as path from 'path'
+import { includeCandidates } from '../Filelist'
 import { maskTemplate } from '../Template'
 
 const INCLUDE_RE = /^[ \t]*`include[ \t]+"([^"]+)"/gm
 
 interface Entry {
   mtimeMs: number
+  ctimeMs: number
   size: number
   includes: string[]
   /// for a file with markup: offset of each line, and [start, end] of each masked part, where
@@ -22,36 +24,66 @@ interface Entry {
 /// again.
 export class TemplateMirror {
   private entries = new Map<string, Entry>()
+  private updating: Promise<boolean> = Promise.resolve(false)
+  private initialized = false
 
   constructor(readonly dir: string) {}
 
   /// Brings the copies of `sources` and the headers they include up to date. False when none of
   /// them has markup, and slang can read the files themselves.
-  async update(sources: string[], incdirs: string[]): Promise<boolean> {
-    const queue = sources.slice()
-    const seen = new Set<string>()
+  update(sources: string[], incdirs: string[]): Promise<boolean> {
+    this.updating = this.updating
+      .catch(() => false)
+      .then(() => this.updateFiles(sources, incdirs))
+    return this.updating
+  }
+
+  private async updateFiles(sources: string[], incdirs: string[]): Promise<boolean> {
+    if (!this.initialized) {
+      // Entries are in memory, so copies from an earlier extension session cannot be trusted.
+      await fs.promises.rm(this.dir, { recursive: true, force: true })
+      this.initialized = true
+    }
+    const queued = new Set(sources)
+    const queue = Array.from(queued)
+    const live = new Set<string>()
     const masked = new Map<string, string>()
+    const stats = new Map<string, Promise<fs.Stats | undefined>>()
+    const stat = (file: string) => {
+      if (!stats.has(file)) {
+        stats.set(
+          file,
+          fs.promises.stat(file).catch((error) => {
+            if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+              return undefined
+            }
+            throw error
+          })
+        )
+      }
+      return stats.get(file)!
+    }
     let markup = false
-    while (queue.length > 0) {
-      const file = queue.shift()!
-      if (seen.has(file)) {
-        continue
+    const visit = async (file: string) => {
+      const info = await stat(file)
+      if (!info?.isFile()) {
+        return
       }
-      seen.add(file)
-      let stat: fs.Stats
-      try {
-        stat = await fs.promises.stat(file)
-      } catch {
-        continue
-      }
+      live.add(file)
       let entry = this.entries.get(file)
-      if (entry === undefined || entry.mtimeMs !== stat.mtimeMs || entry.size !== stat.size) {
+      if (
+        entry === undefined ||
+        entry.mtimeMs !== info.mtimeMs ||
+        entry.ctimeMs !== info.ctimeMs ||
+        entry.size !== info.size
+      ) {
         const text = await fs.promises.readFile(file, 'utf-8')
         const result = maskTemplate(text, true)
         masked.set(file, result.text)
         entry = {
-          mtimeMs: stat.mtimeMs,
-          size: stat.size,
+          mtimeMs: info.mtimeMs,
+          ctimeMs: info.ctimeMs,
+          size: info.size,
           includes: Array.from(text.matchAll(INCLUDE_RE), (m) => m[1]),
           template:
             result.regions.length === 0
@@ -70,31 +102,57 @@ export class TemplateMirror {
       }
       markup = markup || entry.template !== undefined
       for (const name of entry.includes) {
-        for (const dir of [path.dirname(file)].concat(incdirs)) {
-          const header = path.resolve(dir, name)
-          if (fs.existsSync(header)) {
-            queue.push(header)
+        for (const header of includeCandidates(file, name, incdirs)) {
+          if ((await stat(header))?.isFile()) {
+            if (!queued.has(header)) {
+              queued.add(header)
+              queue.push(header)
+            }
             break
           }
         }
       }
     }
+    for (let next = 0; next < queue.length;) {
+      const batch = queue.slice(next, next + 32)
+      next += batch.length
+      const results = await Promise.allSettled(batch.map(visit))
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          throw result.reason
+        }
+      }
+    }
+    for (const [file] of this.entries) {
+      if (!live.has(file)) {
+        await fs.promises.rm(this.copyOf(file), { force: true })
+        this.entries.delete(file)
+      }
+    }
     if (!markup) {
       return false
     }
-    for (const dir of incdirs) {
-      await fs.promises.mkdir(this.copyOf(dir), { recursive: true })
-    }
-    for (const file of seen) {
-      const entry = this.entries.get(file)
-      if (entry === undefined || entry.copied) {
-        continue
+    const changed = Array.from(live).filter((file) => !this.entries.get(file)!.copied)
+    const dirs = new Set(
+      incdirs
+        .map((dir) => this.copyOf(dir))
+        .concat(changed.map((file) => path.dirname(this.copyOf(file))))
+    )
+    await Promise.all(Array.from(dirs, (dir) => fs.promises.mkdir(dir, { recursive: true })))
+    for (let next = 0; next < changed.length; next += 32) {
+      const results = await Promise.allSettled(
+        changed.slice(next, next + 32).map(async (file) => {
+          const text =
+            masked.get(file) ?? maskTemplate(await fs.promises.readFile(file, 'utf-8'), true).text
+          await fs.promises.writeFile(this.copyOf(file), text)
+          this.entries.get(file)!.copied = true
+        })
+      )
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          throw result.reason
+        }
       }
-      const text =
-        masked.get(file) ?? maskTemplate(await fs.promises.readFile(file, 'utf-8'), true).text
-      await fs.promises.mkdir(path.dirname(this.copyOf(file)), { recursive: true })
-      await fs.promises.writeFile(this.copyOf(file), text)
-      entry.copied = true
     }
     return true
   }

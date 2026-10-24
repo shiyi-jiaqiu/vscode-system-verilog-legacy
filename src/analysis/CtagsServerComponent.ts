@@ -9,7 +9,6 @@ import {
   getParentText,
   getPrev2Char,
   getPrevChar,
-  getWorkspaceFolder,
 } from '../utils'
 import builtins from './builtins.json'
 import { getConstValue, getMacroBody, ValueStep } from './ConstValue'
@@ -488,8 +487,7 @@ export class CtagsServerComponent
       let resolvedPath = await resolveInclude(
         document.fileName,
         match[2],
-        ext.projectFilelist,
-        getWorkspaceFolder()
+        ext.projectFilelist
       )
       if (!resolvedPath) {
         continue

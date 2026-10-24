@@ -77,6 +77,8 @@ export class VerilogDoc {
   importSymbols: Symbol[] | undefined
   topSymbols: Symbol[]
   private logger: Logger
+  private parsing: Promise<void> | undefined
+  private parsedVersion = -1
 
   constructor(logger: Logger, document: vscode.TextDocument) {
     this.symbols = []
@@ -92,15 +94,24 @@ export class VerilogDoc {
   }
 
   async getSymbols(filter: SymbolFilter = {}, addImports = true): Promise<Symbol[]> {
-    if (this.isDirty) {
-      this.logger.info('indexing ', this.doc.uri.fsPath)
-      this.clearSymbols()
-      // parse raw symbols
-      let output = await this.execCtags()
-      await this.buildSymbolsList(output)
-      this.importSymbols = undefined
-
-      // TODO: make this parallel, need to make buildSymbolsList functional
+    while (this.isDirty || this.parsedVersion !== this.doc.version) {
+      if (this.parsing === undefined) {
+        this.parsing = (async () => {
+          const version = this.doc.version
+          this.isDirty = true
+          this.logger.info('indexing ', this.doc.uri.fsPath)
+          const output = await this.execCtags(this.doc.getText())
+          if (version !== this.doc.version) {
+            return
+          }
+          await this.buildSymbolsList(output)
+          this.parsedVersion = version
+          this.importSymbols = undefined
+        })().finally(() => {
+          this.parsing = undefined
+        })
+      }
+      await this.parsing
     }
     if (addImports) {
       if (this.importSymbols === undefined) {
@@ -157,7 +168,7 @@ export class VerilogDoc {
     return syms
   }
 
-  async execCtags(): Promise<string> {
+  async execCtags(text: string = this.doc.getText()): Promise<string> {
     let command: string = await ext.ctags.path.getValueAsync()
     // Index the editor text, so unsaved edits are seen. The temp file keeps the
     // extension, which selects the ctags parser.
@@ -165,20 +176,25 @@ export class VerilogDoc {
       os.tmpdir(),
       `vscode-verilog-${process.pid}-${++ctagsInputCount}${path.extname(this.doc.fileName)}`
     )
-    await fs.promises.writeFile(input, maskMacroCalls(maskTemplate(this.doc.getText()).text))
+    await fs.promises.writeFile(input, maskMacroCalls(maskTemplate(text).text))
     let args: string[] =
       '-f - --fields=+K --sort=no --excmd=n --fields-SystemVerilog=+{parameter}'.split(' ')
     args.push(...CTAGS_MAPS)
     args.push(input)
     // this.logger.info('executing ctags: ' + command + ' ' + args.join(' '))
-    return new Promise((resolve, _reject) => {
+    return new Promise<string>((resolve, reject) => {
       child_process.execFile(
         command,
         args,
-        { encoding: 'utf-8' },
-        (_error, stdout: string, _stderr: string) => {
+        { encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024 },
+        (error, stdout: string) => {
           fs.promises.unlink(input).catch(() => {})
-          resolve(stdout)
+          if (error !== null) {
+            this.logger.error(`ctags failed: ${error.message.split('\n')[0]}`)
+            reject(error)
+          } else {
+            resolve(stdout)
+          }
         }
       )
     })
@@ -230,10 +246,6 @@ export class VerilogDoc {
     try {
       if (this.isDirty) {
         this.logger.info('building symbols for ' + this.doc.uri.fsPath)
-        if (tags === '') {
-          this.logger.error('No output from ctags')
-          return
-        }
         // Parse ctags output into symbols
 
         {
@@ -311,6 +323,7 @@ export class VerilogDoc {
       }
     } catch (e) {
       this.logger.error((e as Error).toString())
+      throw e
     }
     // print all syms
     // this.symbols.forEach((sym) => {

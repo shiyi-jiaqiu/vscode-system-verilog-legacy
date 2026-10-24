@@ -68,7 +68,7 @@ export class VerilogExtension extends ActivityBarComponent {
     },
     async () => {
       this.loadFilelist()
-      this.indexFiles(true)
+      return this.indexFiles(true)
         .then(() => {
           vscode.window.showInformationMessage('Reindexing complete')
         })
@@ -191,9 +191,10 @@ export class VerilogExtension extends ActivityBarComponent {
     this.loadFilelist()
     this.watchFilelist()
     context.subscriptions.push(
-      this.filelist.onConfigUpdated(() => {
+      this.filelist.onConfigUpdated(async () => {
         this.loadFilelist()
         this.watchFilelist()
+        await this.indexFiles(true).catch((error) => this.logger.error(String(error)))
       }),
       { dispose: () => this.filelistWatcher?.dispose() }
     )
@@ -204,7 +205,7 @@ export class VerilogExtension extends ActivityBarComponent {
 
     // let ctags index include files
 
-    let tasks = [this.indexFiles()]
+    let tasks = [this.indexFiles().catch((error) => this.logger.error(String(error)))]
     await Promise.all(tasks)
 
     this.logger.info(`${context.extension.id} activation finished.`)
@@ -215,27 +216,9 @@ export class VerilogExtension extends ActivityBarComponent {
       return
     }
 
-    this.index
-      .indexIncludes(reset)
-      .then(() => {
-        this.logger.info('ctags index includes finished')
-      })
-      .catch((err) => {
-        this.logger.error('ctags index includes failed:')
-        this.logger.error(err)
-      })
-
-    // index all files (symlinks in .sv_cache/files + in memory cache)
-    this.index
-      .indexFiles(reset)
-      .then(() => {
-        this.logger.info('index files finished')
-        this.semanticTokens.refresh()
-      })
-      .catch((err) => {
-        this.logger.error('index files failed:')
-        this.logger.error(err)
-      })
+    await Promise.all([this.index.indexIncludes(reset), this.index.indexFiles(reset)])
+    this.semanticTokens.refresh()
+    this.logger.info('index files and includes finished')
   }
 
   /// Reindexes and checks again after the filelist file changes, as Reindex does
@@ -257,7 +240,7 @@ export class VerilogExtension extends ActivityBarComponent {
       this.filelistChange = setTimeout(() => {
         this.logger.info(`filelist ${file} changed`)
         this.loadFilelist()
-        this.indexFiles(true)
+        this.indexFiles(true).catch((error) => this.logger.error(String(error)))
       }, 500)
     }
     this.filelistWatcher.onDidChange(reload)

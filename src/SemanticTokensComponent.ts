@@ -94,10 +94,11 @@ export class SemanticTokensComponent
     const vdoc = ext.index.getVerilogDoc(document)
     const imported = await vdoc.getSymbols()
     const own = vdoc.symbols
+    const ownSet = new Set(own)
     // file level and imported package symbols
     const global = new Map<string, Symbol>()
     for (const sym of imported
-      .filter((s) => !own.includes(s))
+      .filter((s) => !ownSet.has(s))
       .concat(own.filter((s) => s.parentScope === ''))) {
       if (!global.has(sym.name)) {
         global.set(sym.name, sym)
@@ -161,8 +162,8 @@ export class SemanticTokensComponent
       }
     }
     let match: RegExpExecArray | null
-    WORD_RE.lastIndex = 0
-    while ((match = WORD_RE.exec(text)) !== null) {
+    const words = new RegExp(WORD_RE)
+    while ((match = words.exec(text)) !== null) {
       if (token.isCancellationRequested) {
         break
       }

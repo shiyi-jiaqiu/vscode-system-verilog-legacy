@@ -211,11 +211,9 @@ export default class SlangLinter extends ToolConfig {
   })
 
   private diagnostics = vscode.languages.createDiagnosticCollection('slang')
-  /// the running project check; a newer check stops it
-  private projectRun: child_process.ChildProcess | undefined
-  /// counts project checks, so an older one never publishes over a newer one
-  private generation = 0
-  private mirror: TemplateMirror | undefined
+  /// The empty key is the project; other keys are individually checked file paths.
+  private runs = new Map<string, { process?: child_process.ChildProcess }>()
+  private mirrors = new Map<string, TemplateMirror>()
 
   constructor() {
     super('slang')
@@ -230,13 +228,16 @@ export default class SlangLinter extends ToolConfig {
 
   /// Stops a running check and drops all diagnostics
   stop() {
-    this.generation++
-    this.projectRun?.kill()
-    this.projectRun = undefined
+    for (const run of this.runs.values()) {
+      run.process?.kill()
+    }
+    this.runs.clear()
     this.diagnostics.clear()
   }
 
   clear(doc: vscode.TextDocument) {
+    this.runs.get(doc.uri.fsPath)?.process?.kill()
+    this.runs.delete(doc.uri.fsPath)
     this.diagnostics.delete(doc.uri)
   }
 
@@ -251,116 +252,133 @@ export default class SlangLinter extends ToolConfig {
     if (filelist === undefined && target === undefined) {
       return
     }
-    let generation = 0
-    if (project) {
-      this.projectRun?.kill()
-      generation = ++this.generation
-    }
+    const key = project ? '' : target!
+    this.runs.get(key)?.process?.kill()
+    const run: { process?: child_process.ChildProcess } = {}
+    this.runs.set(key, run)
+    const current = () => this.runs.get(key) === run && this.enabled.getValue()
 
-    // copies without template markup, when the files have any
-    let mirror: TemplateMirror | undefined
-    const cacheDir = ext.index.cacheDir?.fsPath
-    if (cacheDir !== undefined) {
-      this.mirror = this.mirror ?? new TemplateMirror(path.join(path.dirname(cacheDir), 'template'))
-      const sources = filelist?.files ?? [target!]
-      const incdirs = filelist?.incdirs ?? [path.dirname(target!)]
-      if (await this.mirror.update(sources, incdirs)) {
-        mirror = this.mirror
-      }
-      if (project && generation !== this.generation) {
-        return
-      }
-    }
-    const copy = (file: string) => (mirror === undefined ? file : mirror.copyOf(file))
-    let args = ['--diag-json', '-']
-    if (filelist === undefined) {
-      args.push('+incdir+' + copy(path.dirname(target!)))
-      if (cacheDir !== undefined) {
-        // links to all module files, so slang finds the modules the target uses
-        args.push('-y', cacheDir)
-      }
-      args.push(copy(target!))
-    } else if (mirror === undefined) {
-      args.push('-f', filelist.path)
-    } else {
-      const copied = path.join(mirror.dir, 'filelist.f')
-      const lines = filelist.options.concat(
-        filelist.incdirs.map((dir) => `+incdir+"${mirror!.copyOf(dir)}"`),
-        filelist.files.map((file) => `"${mirror!.copyOf(file)}"`)
-      )
-      await fs.promises.writeFile(copied, lines.join('\n') + '\n')
-      args.push('-f', copied)
-    }
-    args = args.concat(this.args.getValue().split(/\s+/).filter(Boolean))
-    // the check that diagnostics without a place in the code are shown on
-    const unlocated = filelist?.path ?? target!
-    const command = this.path.getValue()
-    this.logger.info(`running ${command} ${args.join(' ')}`)
-    const stdout = await new Promise<string | undefined>((resolve) => {
-      const proc = child_process.execFile(
-        command,
-        args,
-        // a project with many warnings exceeds the default 1 MB, which kills the tool
-        { cwd: root, encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024 },
-        (error, out, err) => {
-          if (project && generation !== this.generation) {
-            resolve(undefined)
-            return
-          }
-          // the array of diagnostics, between the design units and the build summary
-          const json = /^\[$[\s\S]*^\]$/m.exec(out)
-          // slang exits with 1 when it reports errors; anything else means it did not finish
-          if (error !== null && typeof error.code !== 'number') {
-            this.reportFailure(
-              error.signal ? `stopped by ${error.signal}` : error.message.split('\n')[0]
-            )
-            resolve(undefined)
-          } else if (json === null) {
-            // such as for an unknown argument
-            this.reportFailure(err.trim().split('\n')[0] || `exit code ${error?.code}`)
-            resolve(undefined)
-          } else {
-            resolve(json[0])
-          }
-        }
-      )
-      if (project) {
-        this.projectRun = proc
-      }
-    })
-    if (stdout === undefined) {
-      return
-    }
-    let entries: SlangDiagnostic[]
     try {
-      entries = JSON.parse(stdout)
-    } catch (e) {
-      this.reportFailure(`unreadable diagnostics: ${e}`)
-      return
-    }
-    const files = toDiagnostics(entries, root, unlocated, mirror)
-    if (project && filelist === undefined && ext.index.cacheDir !== undefined) {
-      // modules found through -y are reported at their links
-      for (const [file, diags] of Array.from(files)) {
-        if (file.startsWith(ext.index.cacheDir.fsPath)) {
-          files.delete(file)
-          const real = await fs.promises.realpath(file).catch(() => file)
-          files.set(real, (files.get(real) ?? []).concat(diags))
+      // copies without template markup, when the files have any
+      let mirror: TemplateMirror | undefined
+      const cacheDir = ext.index.cacheDir?.fsPath
+      if (cacheDir !== undefined) {
+        let cached = this.mirrors.get(key)
+        if (cached === undefined) {
+          cached = new TemplateMirror(
+            path.join(path.dirname(cacheDir), 'template', project ? 'project' : 'files', key)
+          )
+          this.mirrors.set(key, cached)
+        }
+        const sources = filelist?.files ?? [target!]
+        const incdirs = filelist?.incdirs ?? [path.dirname(target!)]
+        if (await cached.update(sources, incdirs)) {
+          mirror = cached
+        }
+        if (!current()) {
+          return
         }
       }
-    }
-    if (project) {
-      if (generation !== this.generation || !this.enabled.getValue()) {
+      const copy = (file: string) => (mirror === undefined ? file : mirror.copyOf(file))
+      let args = ['--diag-json', '-']
+      if (filelist === undefined) {
+        args.push('+incdir+' + copy(path.dirname(target!)))
+        if (cacheDir !== undefined) {
+          // links to all module files, so slang finds the modules the target uses
+          args.push('-y', cacheDir)
+        }
+        args.push(copy(target!))
+      } else if (mirror === undefined) {
+        args.push('-f', filelist.path)
+      } else {
+        const copied = path.join(mirror.dir, 'filelist.f')
+        const lines = filelist.options.concat(
+          filelist.incdirs.map((dir) => `+incdir+"${mirror!.copyOf(dir)}"`),
+          filelist.files.map((file) => `"${mirror!.copyOf(file)}"`)
+        )
+        await fs.promises.writeFile(copied, lines.join('\n') + '\n')
+        args.push('-f', copied)
+      }
+      args = args.concat(this.args.getValue().split(/\s+/).filter(Boolean))
+      // the check that diagnostics without a place in the code are shown on
+      const unlocated = filelist?.path ?? target!
+      const command = this.path.getValue()
+      if (!current()) {
         return
       }
-      this.diagnostics.clear()
-      for (const [file, diags] of files) {
-        this.diagnostics.set(vscode.Uri.file(file), diags)
+      this.logger.info(`running ${command} ${args.join(' ')}`)
+      const stdout = await new Promise<string | undefined>((resolve) => {
+        const proc = child_process.execFile(
+          command,
+          args,
+          // a project with many warnings exceeds the default 1 MB, which kills the tool
+          { cwd: root, encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024 },
+          (error, out, err) => {
+            if (!current()) {
+              resolve(undefined)
+              return
+            }
+            // the array of diagnostics, between the design units and the build summary
+            const json = /^\[$[\s\S]*^\]$/m.exec(out)
+            // slang exits with 1 when it reports errors; anything else means it did not finish
+            if (error !== null && typeof error.code !== 'number') {
+              this.reportFailure(
+                error.signal ? `stopped by ${error.signal}` : error.message.split('\n')[0]
+              )
+              resolve(undefined)
+            } else if (json === null) {
+              // such as for an unknown argument
+              this.reportFailure(err.trim().split('\n')[0] || `exit code ${error?.code}`)
+              resolve(undefined)
+            } else {
+              resolve(json[0])
+            }
+          }
+        )
+        run.process = proc
+      })
+      if (stdout === undefined) {
+        return
       }
-      this.logger.info(`${entries.length} diagnostics in ${files.size} files`)
-    } else if (doc !== undefined) {
-      // other files are reported as this file sees them, which may be wrong
-      this.diagnostics.set(doc.uri, files.get(doc.uri.fsPath) ?? [])
+      let entries: SlangDiagnostic[]
+      try {
+        entries = JSON.parse(stdout)
+      } catch (e) {
+        this.reportFailure(`unreadable diagnostics: ${e}`)
+        return
+      }
+      const files = toDiagnostics(entries, root, unlocated, mirror)
+      if (project && filelist === undefined && ext.index.cacheDir !== undefined) {
+        // modules found through -y are reported at their links
+        for (const [file, diags] of Array.from(files)) {
+          if (file.startsWith(ext.index.cacheDir.fsPath)) {
+            files.delete(file)
+            const real = await fs.promises.realpath(file).catch(() => file)
+            files.set(real, (files.get(real) ?? []).concat(diags))
+          }
+        }
+      }
+      if (!current()) {
+        return
+      }
+      if (project) {
+        this.diagnostics.clear()
+        for (const [file, diags] of files) {
+          this.diagnostics.set(vscode.Uri.file(file), diags)
+        }
+        this.logger.info(`${entries.length} diagnostics in ${files.size} files`)
+      } else if (doc !== undefined) {
+        // other files are reported as this file sees them, which may be wrong
+        this.diagnostics.set(doc.uri, files.get(doc.uri.fsPath) ?? [])
+      }
+    } catch (error) {
+      if (current()) {
+        this.reportFailure(String(error))
+      }
+    } finally {
+      if (this.runs.get(key) === run) {
+        this.runs.delete(key)
+      }
     }
   }
 

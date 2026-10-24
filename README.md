@@ -11,12 +11,12 @@ This fork of the [AndrewNolte Verilog/SystemVerilog extension](https://github.co
 - **Perl templates**: Verilog with `<perl>...</perl>` blocks of Perl code and `<pl>...</pl>` Perl expressions is checked without running Perl. Slang reads copies, kept in the extension's storage, where the markup and the Verilog inside Perl loops and ifs (over any number of blocks) are blanked out, with lines and columns unchanged; markup within a line of Verilog becomes a placeholder name. What slang reports about the markup or right after it is dropped, and so are undeclared names in a file with markup, which the markup may declare; their number is shown at the first markup. The index, hovers and highlighting skip the markup, and the editor colors it as Perl.
 - **Uses of a signal** in its module are highlighted under the cursor, assignments and declarations as writes, skipping comments, strings and `.port(` names; F7 and Shift+F7 go to the next and previous use.
 
-Values are computed lexically from defaults; parameter overrides at instantiations are not applied. Ctags runs on the editor text with macro calls blanked out, so a macro inside a port or parameter list no longer hides the rest of the list. A module whose name is itself a macro is not indexed.
+Values are computed lexically from defaults; parameter overrides at instantiations are not applied. Expressions involving based literals, packed or unsigned declarations, or integer overflow are left unevaluated instead of displaying a value without the required SystemVerilog sizing rules. Ctags runs on the editor text with macro calls blanked out, so a macro inside a port or parameter list no longer hides the rest of the list. A module whose name is itself a macro is not indexed.
 
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.4.1.vsix
+code --install-extension verilog-systemverilog-legacy-0.4.2.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.

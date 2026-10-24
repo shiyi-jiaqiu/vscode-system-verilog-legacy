@@ -25,6 +25,14 @@ export class IndexComponent extends ExtensionComponent {
   readonly headerFiles: Map<string, vscode.Uri[]> = new Map()
   /// `define name -> [ctags kind, line of the `define], from the headers, for completion
   readonly headerMacros: Map<string, [string, string]> = new Map()
+  private headers = new Map<
+    string,
+    {
+      uri: vscode.Uri
+      symbols: { name: string; kind: string; text: string; macro: boolean }[]
+    }
+  >()
+  private headerIndex: Promise<void> = Promise.resolve()
 
   /// module/interface/package/class/program name -> ctags kind, from all indexed files
   readonly unitKinds: Map<string, string> = new Map()
@@ -40,11 +48,24 @@ export class IndexComponent extends ExtensionComponent {
 
     // file save, rename, delete mgmt
     context.subscriptions.push(
-      vscode.workspace.onDidSaveTextDocument((doc: vscode.TextDocument) => {
+      vscode.workspace.onDidSaveTextDocument(async (doc: vscode.TextDocument) => {
+        if (!isAnyVerilog(doc.languageId)) {
+          return
+        }
         this.indexFile(doc.uri)
         this.getVerilogDoc(doc).clearSymbols()
-        if (isAnyVerilog(doc.languageId)) {
-          this.indexNames([doc.uri])
+        try {
+          const tasks = [this.indexNames([doc.uri])]
+          if (
+            this.headers.has(doc.uri.fsPath) ||
+            (/\.(svh|vh)$/i.test(doc.fileName) &&
+              (await ext.findIncludes()).some((uri) => uri.fsPath === doc.uri.fsPath))
+          ) {
+            tasks.push(this.indexIncludes(false, [doc.uri]))
+          }
+          await Promise.all(tasks)
+        } catch (error) {
+          this.logger.error(String(error))
         }
       })
     )
@@ -117,6 +138,9 @@ export class IndexComponent extends ExtensionComponent {
       this.moduleMap.clear()
       this.unitKinds.clear()
       this.macroFiles.clear()
+      for (const doc of this.filemap.values()) {
+        doc.clearSymbols()
+      }
     }
 
     await vscode.window.withProgress(
@@ -200,7 +224,7 @@ export class IndexComponent extends ExtensionComponent {
   private async ctags(files: string[], kinds: string = ''): Promise<string> {
     const command = await ext.ctags.path.getValueAsync()
     const args = ['-f', '-', '--fields=+K', '--sort=no', '--excmd=n', '-L', '-']
-    return await new Promise<string>((resolve) => {
+    return await new Promise<string>((resolve, reject) => {
       const proc = child_process.execFile(
         command,
         args.concat(kinds.split(' ').filter(Boolean), CTAGS_MAPS),
@@ -208,8 +232,10 @@ export class IndexComponent extends ExtensionComponent {
         (error, out) => {
           if (error !== null) {
             this.logger.error(`ctags failed: ${error.message.split('\n')[0]}`)
+            reject(error)
+          } else {
+            resolve(out)
           }
-          resolve(out)
         }
       )
       proc.stdin?.end(files.join('\n') + '\n')
@@ -219,61 +245,76 @@ export class IndexComponent extends ExtensionComponent {
   /// Finds the top level symbols of the headers with one ctags process, run on copies with
   /// macro calls blanked out as for an open file. A header is opened only when one of its
   /// symbols is asked for.
-  async indexIncludes(reset: boolean = false): Promise<void> {
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Window,
-        title: 'Indexing Verilog Includes',
-        cancellable: false,
-      },
-      async () => {
-        const files = await ext.findIncludes()
-        this.logger.info(`indexing ${files.length} .svh files`)
-        if (reset) {
-          this.headerFiles.clear()
-          this.headerMacros.clear()
-        }
-        const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'vscode-verilog-'))
-        try {
-          const texts = await Promise.all(
-            files.map((file) => fs.promises.readFile(file.fsPath, 'utf-8').catch(() => ''))
-          )
-          // the extension selects the ctags parser
-          const copies = files.map((file, i) => path.join(dir, i + path.extname(file.fsPath)))
-          await Promise.all(
-            copies.map((copy, i) =>
-              fs.promises.writeFile(copy, maskMacroCalls(maskTemplate(texts[i]).text))
-            )
-          )
-          const lines = new Map<number, string[]>()
-          for (const tag of (await this.ctags(copies)).split(/\r?\n/)) {
-            // top level tags have no scope field; `_` stands for a masked macro call
-            const [name, copy, line, kind, scope] = tag.split('\t')
-            if (kind === undefined || scope !== undefined || name === '_') {
-              continue
+  indexIncludes(reset: boolean = false, changed?: vscode.Uri[]): Promise<void> {
+    this.headerIndex = this.headerIndex
+      .catch(() => {})
+      .then(async () => {
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Window,
+            title: 'Indexing Verilog Includes',
+            cancellable: false,
+          },
+          async () => {
+            const files = changed ?? (await ext.findIncludes())
+            this.logger.info(`indexing ${files.length} .svh files`)
+            const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'vscode-verilog-'))
+            try {
+              const texts = await Promise.all(
+                files.map((file) => fs.promises.readFile(file.fsPath, 'utf-8').catch(() => ''))
+              )
+              // the extension selects the ctags parser
+              const copies = files.map((file, i) => path.join(dir, i + path.extname(file.fsPath)))
+              await Promise.all(
+                copies.map((copy, i) =>
+                  fs.promises.writeFile(copy, maskMacroCalls(maskTemplate(texts[i]).text))
+                )
+              )
+              const lines = new Map<number, string[]>()
+              const tags = await this.ctags(copies)
+              if (reset) {
+                this.headers.clear()
+              }
+              for (const file of files) {
+                this.headers.set(file.fsPath, { uri: file, symbols: [] })
+              }
+              for (const tag of tags.split(/\r?\n/)) {
+                // top level tags have no scope field; `_` stands for a masked macro call
+                const [name, copy, line, kind, scope] = tag.split('\t')
+                if (kind === undefined || scope !== undefined || name === '_') {
+                  continue
+                }
+                const i = Number(path.basename(copy, path.extname(copy)))
+                if (!lines.has(i)) {
+                  lines.set(i, texts[i].split(/\r?\n/))
+                }
+                const text = lines.get(i)![Number(line.slice(0, -2)) - 1] ?? ''
+                // ctags before 6.1 calls a `define a constant
+                const macro = kind === 'define' || text.trimStart().startsWith('`define')
+                this.headers.get(files[i].fsPath)!.symbols.push({ name, kind, text, macro })
+              }
+              this.headerFiles.clear()
+              this.headerMacros.clear()
+              for (const { uri, symbols } of this.headers.values()) {
+                for (const { name, kind, text, macro } of symbols) {
+                  const uris = this.headerFiles.get(name) ?? []
+                  if (!uris.includes(uri)) {
+                    uris.push(uri)
+                  }
+                  this.headerFiles.set(name, uris)
+                  if (macro && !this.headerMacros.has(name)) {
+                    this.headerMacros.set(name, [kind, text])
+                  }
+                }
+              }
+            } finally {
+              await fs.promises.rm(dir, { recursive: true, force: true })
             }
-            const i = Number(path.basename(copy, path.extname(copy)))
-            const uris = this.headerFiles.get(name) ?? []
-            if (!uris.some((uri) => uri.fsPath === files[i].fsPath)) {
-              uris.push(files[i])
-            }
-            this.headerFiles.set(name, uris)
-            if (!lines.has(i)) {
-              lines.set(i, texts[i].split(/\r?\n/))
-            }
-            const text = lines.get(i)![Number(line.slice(0, -2)) - 1] ?? ''
-            // ctags before 6.1 calls a `define a constant
-            const macro = kind === 'define' || text.trimStart().startsWith('`define')
-            if (macro && !this.headerMacros.has(name)) {
-              this.headerMacros.set(name, [kind, text])
-            }
+            this.logger.info(`indexed ${files.length} .svh files`)
           }
-        } finally {
-          await fs.promises.rm(dir, { recursive: true, force: true })
-        }
-        this.logger.info(`indexed ${files.length} .svh files`)
-      }
-    )
+        )
+      })
+    return this.headerIndex
   }
 
   /// Top level symbols named `name` in the headers
@@ -349,6 +390,9 @@ export class IndexComponent extends ExtensionComponent {
     }
     let verilogDoc = this.getVerilogDoc(document)
     let targetText = document.getText(textRange)
+    if (getPrevChar(document, textRange.start) === '`') {
+      return await this.findMacro(document, targetText)
+    }
     // symbol tree first, unitAt needs it
     let symPromise = verilogDoc
       .getSymbolTree()
@@ -374,15 +418,6 @@ export class IndexComponent extends ExtensionComponent {
       }
     }
 
-    const headerSyms = await this.findHeaderSymbols(targetText)
-    if (headerSyms.length > 0) {
-      return headerSyms
-    }
-
-    if (getPrevChar(document, textRange.start) === '`') {
-      return await this.findMacro(document, targetText)
-    }
-
     if (this.moduleMap.has(targetText) || this.moduleMap.has(parentScope)) {
       // find parentScope.sv of parentScope::targetText
       let sym = (await this.findDefinitionByName(parentScope, targetText)).at(0)
@@ -391,6 +426,12 @@ export class IndexComponent extends ExtensionComponent {
         return [sym]
       }
     }
-    return await symPromise
+    const local = (await symPromise).filter(
+      (sym) => !sym.isMacro() || (sym.doc === document && sym.getIdRange().contains(position))
+    )
+    if (local.length > 0) {
+      return local
+    }
+    return (await this.findHeaderSymbols(targetText)).filter((sym) => !sym.isMacro())
   }
 }
