@@ -8,6 +8,8 @@ export interface Filelist {
   incdirs: string[]
   /// macro name -> value ('' when defined without one)
   defines: Map<string, string>
+  /// the arguments other than sources and include directories, such as the macros or `--top name`
+  options: string[]
 }
 
 const HDL_FILE = /\.(v|vl|vh|sv|svh)$/i
@@ -16,7 +18,7 @@ const HDL_FILE = /\.(v|vl|vh|sv|svh)$/i
 /// directories and +define+/-D macros. Relative paths resolve against the workspace root,
 /// where the linters run.
 export function readFilelist(file: string, root: string): Filelist {
-  const result: Filelist = { path: file, files: [], incdirs: [], defines: new Map() }
+  const result: Filelist = { path: file, files: [], incdirs: [], defines: new Map(), options: [] }
   const text = fs
     .readFileSync(file, 'utf8')
     .split(/\r?\n/)
@@ -36,6 +38,7 @@ export function readFilelist(file: string, root: string): Filelist {
       }
     } else if (tok.startsWith('+define+')) {
       tok.slice(8).split('+').filter(Boolean).forEach(addDefine)
+      result.options.push(tok)
     } else if (tok.startsWith('-I')) {
       const dir = tok.length > 2 ? tok.slice(2) : tokens[++i]
       if (dir !== undefined) {
@@ -45,9 +48,12 @@ export function readFilelist(file: string, root: string): Filelist {
       const def = tok.length > 2 ? tok.slice(2) : tokens[++i]
       if (def !== undefined) {
         addDefine(def)
+        result.options.push('-D', def)
       }
     } else if (!tok.startsWith('-') && !tok.startsWith('+') && HDL_FILE.test(tok)) {
       result.files.push(path.resolve(root, tok))
+    } else {
+      result.options.push(tok)
     }
   }
   return result

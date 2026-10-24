@@ -6,6 +6,7 @@ import { CTAGS_MAPS, maskMacroCalls, VerilogDoc } from './analysis/VerilogDoc'
 import { ext } from './extension'
 import { ExtensionComponent } from './lib/libconfig'
 import { getParentText, getPrevChar, isAnyVerilog } from './utils'
+import { maskTemplate } from './Template'
 import fs = require('fs')
 import os = require('os')
 import path = require('path')
@@ -240,7 +241,9 @@ export class IndexComponent extends ExtensionComponent {
           // the extension selects the ctags parser
           const copies = files.map((file, i) => path.join(dir, i + path.extname(file.fsPath)))
           await Promise.all(
-            copies.map((copy, i) => fs.promises.writeFile(copy, maskMacroCalls(texts[i])))
+            copies.map((copy, i) =>
+              fs.promises.writeFile(copy, maskMacroCalls(maskTemplate(texts[i]).text))
+            )
           )
           const lines = new Map<number, string[]>()
           for (const tag of (await this.ctags(copies)).split(/\r?\n/)) {

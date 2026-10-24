@@ -203,6 +203,7 @@ export function computeInactivePreprocessorRanges(
 export class InactiveRegionsComponent extends ExtensionComponent {
   private decorationType = vscode.window.createTextEditorDecorationType({ opacity: '0.5' })
   private enabled = false
+  private pending = new Map<vscode.TextDocument, NodeJS.Timeout>()
 
   async activate(context: vscode.ExtensionContext): Promise<void> {
     if (ext.slangExtensionActive()) {
@@ -214,9 +215,17 @@ export class InactiveRegionsComponent extends ExtensionComponent {
       this.decorationType,
       vscode.window.onDidChangeVisibleTextEditors(() => this.update()),
       vscode.workspace.onDidChangeTextDocument((e) => {
-        vscode.window.visibleTextEditors
-          .filter((editor) => editor.document === e.document)
-          .forEach((editor) => this.updateEditor(editor))
+        // the whole document is read again, so once typing pauses
+        clearTimeout(this.pending.get(e.document))
+        this.pending.set(
+          e.document,
+          setTimeout(() => {
+            this.pending.delete(e.document)
+            vscode.window.visibleTextEditors
+              .filter((editor) => editor.document === e.document)
+              .forEach((editor) => this.updateEditor(editor))
+          }, 300)
+        )
       })
     )
     this.update()

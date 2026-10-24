@@ -172,6 +172,8 @@ export class VerilogExtension extends ActivityBarComponent {
   context: vscode.ExtensionContext
   /// parsed `verilog.filelist`, if one is configured
   projectFilelist: Filelist | undefined = undefined
+  private filelistWatcher: vscode.FileSystemWatcher | undefined
+  private filelistChange: NodeJS.Timeout | undefined
 
   constructor(context: vscode.ExtensionContext, obj: ViewContainerSpec) {
     super(obj)
@@ -187,7 +189,14 @@ export class VerilogExtension extends ActivityBarComponent {
     )
     // also starts the first check
     this.loadFilelist()
-    context.subscriptions.push(this.filelist.onConfigUpdated(() => this.loadFilelist()))
+    this.watchFilelist()
+    context.subscriptions.push(
+      this.filelist.onConfigUpdated(() => {
+        this.loadFilelist()
+        this.watchFilelist()
+      }),
+      { dispose: () => this.filelistWatcher?.dispose() }
+    )
 
     /////////////////////////////////////////////
     // Slow async tasks
@@ -227,6 +236,33 @@ export class VerilogExtension extends ActivityBarComponent {
         this.logger.error('index files failed:')
         this.logger.error(err)
       })
+  }
+
+  /// Reindexes and checks again after the filelist file changes, as Reindex does
+  private watchFilelist() {
+    this.filelistWatcher?.dispose()
+    this.filelistWatcher = undefined
+    const configured = this.filelist.getValue()
+    const ws = getWorkspaceFolder()
+    if (configured === '' || ws === undefined) {
+      return
+    }
+    const file = path.resolve(ws, configured)
+    this.filelistWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(file), path.basename(file))
+    )
+    const reload = () => {
+      // an editor or a script may write it in several steps
+      clearTimeout(this.filelistChange)
+      this.filelistChange = setTimeout(() => {
+        this.logger.info(`filelist ${file} changed`)
+        this.loadFilelist()
+        this.indexFiles(true)
+      }, 500)
+    }
+    this.filelistWatcher.onDidChange(reload)
+    this.filelistWatcher.onDidCreate(reload)
+    this.filelistWatcher.onDidDelete(reload)
   }
 
   loadFilelist() {

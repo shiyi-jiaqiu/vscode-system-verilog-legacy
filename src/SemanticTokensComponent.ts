@@ -3,6 +3,7 @@ import * as vscode from 'vscode'
 import { Symbol } from './analysis/Symbol'
 import { ext } from './extension'
 import { ExtensionComponent } from './lib/libconfig'
+import { maskTemplate } from './Template'
 import { anyVerilogSelector } from './utils'
 
 // `port` and `instance` are declared in package.json with parameter/variable as super types
@@ -151,7 +152,8 @@ export class SemanticTokensComponent
     }
 
     const builder = new vscode.SemanticTokensBuilder(legend)
-    const text = document.getText()
+    // Perl template markup is not Verilog
+    const text = maskTemplate(document.getText()).text
     const push = (offset: number, length: number, kind: TokenKind | undefined) => {
       if (kind !== undefined) {
         const pos = document.positionAt(offset)

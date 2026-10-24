@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 import { ext } from '../extension'
 import { Symbol } from './Symbol'
+import { VerilogDoc } from './VerilogDoc'
 
 /// Default values of parameters and object-like macros, found lexically: identifiers are
 /// replaced by their declared values (same scope, then imports, `pkg::`, macros and
@@ -79,8 +80,35 @@ async function findConstant(
   return consts.find((sym) => sym.parentScope === scope.parentScope) ?? consts[0]
 }
 
-/// Replaces names in `expr` (written in the context of `scope`) by their values, recursively.
-async function substitute(expr: string, scope: Symbol, depth: number): Promise<string | undefined> {
+/// A parameter or macro that a value is computed through
+export interface ValueStep {
+  /// with a leading ` for a macro
+  name: string
+  /// its written value; undefined when it is not defined
+  text: string | undefined
+  value: bigint | undefined
+  /// 0 for the names in the hovered value, 1 for the names in theirs, ...
+  depth: number
+  /// the definition, undefined for a macro from the filelist
+  sym: Symbol | undefined
+}
+
+/// Where a macro is used: the text of a macro is read there, so names in it are looked up as
+/// seen from `unit` (a module, interface or package) of `doc`
+export interface UseSite {
+  doc: VerilogDoc
+  unit: string | undefined
+}
+
+/// Replaces names in `expr` (written in the context of `scope`, or expanded at `site`) by their
+/// values, recursively, and records each name in `steps` once.
+async function substitute(
+  expr: string,
+  scope: Symbol,
+  depth: number,
+  site: UseSite | undefined,
+  steps: ValueStep[]
+): Promise<string | undefined> {
   if (depth > MAX_DEPTH) {
     return undefined
   }
@@ -88,6 +116,8 @@ async function substitute(expr: string, scope: Symbol, depth: number): Promise<s
     /(`?)([A-Za-z_]\w*)(?:::([A-Za-z_]\w*))?|\$clog2|\d*'[sS]?[bodhBODH][0-9a-fA-F_xzXZ?]+/g
   let out = ''
   let last = 0
+  // the other names are still looked up, for the steps
+  let failed = false
   let match: RegExpExecArray | null
   while ((match = nameRe.exec(expr)) !== null) {
     out += expr.slice(last, match.index)
@@ -98,44 +128,58 @@ async function substitute(expr: string, scope: Symbol, depth: number): Promise<s
       out += whole
       continue
     }
+    const name = tick === '`' ? '`' + first : whole
+    const step: ValueStep = { name, text: undefined, value: undefined, depth, sym: undefined }
+    const recorded = steps.some((s) => s.name === name)
+    if (!recorded) {
+      steps.push(step)
+    }
     let value: string | undefined
     if (tick === '`') {
-      value = await macroValue(scope, first, depth + 1)
+      const macro = (await ext.index.findMacro(site?.doc.doc ?? scope.doc, first))[0]
+      step.sym = macro
+      step.text =
+        macro !== undefined ? getMacroBody(macro) : ext.projectFilelist?.defines.get(first)
+      if (step.text !== undefined && step.text !== '') {
+        // a macro's text is read where it is used
+        value = await substitute(step.text, macro ?? scope, depth + 1, site, recorded ? [] : steps)
+      }
     } else {
-      const sym = await findConstant(
-        scope,
-        second ?? first,
-        second === undefined ? undefined : first
-      )
-      const text = sym && getDeclValueText(sym)
-      value = text && (await substitute(text, sym, depth + 1))
+      const visible =
+        second === undefined && site !== undefined
+          ? (await site.doc.findVisible(first, site.unit)).find((sym) => sym.isConstant())
+          : undefined
+      const sym =
+        visible ??
+        (await findConstant(scope, second ?? first, second === undefined ? undefined : first))
+      step.sym = sym
+      step.text = sym && getDeclValueText(sym)
+      // a parameter's value is read where it is declared
+      value =
+        step.text &&
+        (await substitute(step.text, sym!, depth + 1, undefined, recorded ? [] : steps))
     }
-    if (value === undefined) {
-      return undefined
-    }
+    step.value = value === undefined ? undefined : evalConst(value)
+    failed = failed || value === undefined
     out += '(' + value + ')'
   }
-  return out + expr.slice(last)
-}
-
-async function macroValue(scope: Symbol, name: string, depth: number): Promise<string | undefined> {
-  const macro = (await ext.index.findMacro(scope.doc, name))[0]
-  const body = macro !== undefined ? getMacroBody(macro) : ext.projectFilelist?.defines.get(name)
-  if (body === undefined || body === '') {
-    return undefined
-  }
-  return await substitute(body, macro ?? scope, depth)
+  return failed ? undefined : out + expr.slice(last)
 }
 
 /// Default value of a parameter or object-like macro, if it is a constant integer expression.
-export async function getConstValue(sym: Symbol): Promise<bigint | undefined> {
+/// A macro used at `site` is read there. `steps` receives the names it was computed through.
+export async function getConstValue(
+  sym: Symbol,
+  site: UseSite | undefined = undefined,
+  steps: ValueStep[] = []
+): Promise<bigint | undefined> {
   let expr: string | undefined
   if (sym.isMacro()) {
     const body = getMacroBody(sym)
-    expr = body && (await substitute(body, sym, 0))
+    expr = body && (await substitute(body, sym, 0, site, steps))
   } else if (sym.isConstant()) {
     const text = getDeclValueText(sym)
-    expr = text && (await substitute(text, sym, 0))
+    expr = text && (await substitute(text, sym, 0, undefined, steps))
   }
   return expr === undefined ? undefined : evalConst(expr)
 }

@@ -2,7 +2,7 @@
   "name": "verilog-systemverilog-legacy",
   "displayName": "Verilog/SystemVerilog Legacy",
   "description": "Ctags-based Verilog/SystemVerilog indexing, hovers with parameter and macro values, semantic highlighting and project linting, for VS Code 1.84",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "local",
   "keywords": [
     "verilog",
@@ -266,6 +266,17 @@
         "language": "dotf",
         "scopeName": "source.f",
         "path": "./languages/dotf/dotf.tmLanguage.json"
+      },
+      {
+        "scopeName": "verilog.perl-markup.injection",
+        "path": "./languages/template/perl-markup.json",
+        "injectTo": [
+          "source.verilog",
+          "source.systemverilog"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.perl": "perl"
+        }
       }
     ],
     "snippets": [

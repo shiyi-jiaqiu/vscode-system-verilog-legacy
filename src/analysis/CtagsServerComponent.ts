@@ -3,6 +3,7 @@ import * as vscode from 'vscode'
 import { ext } from '../extension'
 import { resolveInclude } from '../Filelist'
 import { ExtensionComponent, PathConfigObject } from '../lib/libconfig'
+import { maskTemplate } from '../Template'
 import {
   anyVerilogSelector,
   getParentText,
@@ -11,30 +12,55 @@ import {
   getWorkspaceFolder,
 } from '../utils'
 import builtins from './builtins.json'
-import { getConstValue, getMacroBody } from './ConstValue'
+import { getConstValue, getMacroBody, ValueStep } from './ConstValue'
 import { Symbol, SymbolCompletionItem } from './Symbol'
 
 /// Completion of the `define of `name` on line `ln`, with a placeholder for each argument
 function macroCompletionItem(name: string, kind: string, ln: string): vscode.CompletionItem {
-  let args = ln.substring(ln.indexOf('(') + 1, ln.indexOf(')'))
-
-  let snip = new vscode.SnippetString(name + '(')
-  let arglist = args.split(',')
-  for (let i = 0; i < arglist.length; i++) {
-    snip.appendPlaceholder(arglist[i].trim())
-    if (i !== arglist.length - 1) {
-      snip.appendText(', ')
-    }
-  }
-  snip.appendText(')')
-  let txt = ln.substring(ln.indexOf(name), ln.indexOf(')') + 1)
-  let item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Snippet)
+  const item = new vscode.CompletionItem('`' + name, vscode.CompletionItemKind.Snippet)
   item.detail = kind
   item.filterText = name
-  item.insertText = snip
-  item.documentation = txt
-  item.label = '`' + item.label
+  item.documentation = ln.trim()
+  // arguments come right after the name, as in `define NAME(a, b)
+  const args = new RegExp('`define\\s+' + name + '\\(([^)]*)\\)').exec(ln)
+  if (args === null) {
+    item.insertText = name
+    return item
+  }
+  const snip = new vscode.SnippetString(name + '(')
+  args[1].split(',').forEach((arg, i) => {
+    if (i > 0) {
+      snip.appendText(', ')
+    }
+    snip.appendPlaceholder(arg.trim())
+  })
+  item.insertText = snip.appendText(')')
   return item
+}
+
+/// A markdown list item for a parameter or macro that a value goes through
+function stepText(step: ValueStep): string {
+  const code = (s: string) => (s.includes('`') ? '`` ' + s + ' ``' : '`' + s + '`')
+  let text = '  '.repeat(step.depth) + '- ' + code(step.name)
+  if (step.text === undefined || step.text === '') {
+    if (step.sym !== undefined) {
+      text += ' has no value'
+    } else {
+      text += step.text === '' ? ' is defined without a value' : ' is not defined'
+    }
+  } else {
+    text += ' = ' + code(step.text)
+    if (step.value !== undefined && step.value.toString() !== step.text) {
+      text += ' = ' + code(step.value.toString())
+    }
+  }
+  if (step.sym !== undefined) {
+    const uri = step.sym.doc.uri.with({ fragment: `L${step.sym.line + 1}` })
+    text += ` · [${vscode.workspace.asRelativePath(step.sym.doc.uri)}:${step.sym.line + 1}](${uri})`
+  } else if (step.text !== undefined) {
+    text += ' · from `verilog.filelist`'
+  }
+  return text
 }
 
 /// right hand side of `name = value` hover text, to skip repeating a literal value
@@ -377,12 +403,28 @@ export class CtagsServerComponent
     } else {
       md.appendCodeblock(hover, document.languageId)
     }
-    const value = await getConstValue(sym)
+    // a macro used here is read here: names in it are looked up from this module
+    const here = ext.index.getVerilogDoc(document)
+    const site =
+      sym.isMacro() && pchar === '`' ? { doc: here, unit: here.unitAt(position) } : undefined
+    const steps: ValueStep[] = []
+    const value = await getConstValue(sym, site, steps)
     const written = sym.isMacro() ? getMacroBody(sym) : getValueText(hover)
     if (value !== undefined && value.toString() !== written) {
       md.appendMarkdown(
         `= \`${value}\`` + (value >= 16n ? ` (\`0x${value.toString(16)}\`)` : '') + '\n\n'
       )
+    }
+    // the macros a value goes through, down to its number or to the name that is not defined;
+    // related parameters are shown below
+    if (sym.isMacro() || steps.some((step) => step.name.startsWith('`'))) {
+      const lines = steps.slice(0, 20).map(stepText)
+      if (steps.length > 20) {
+        lines.push(`- ${steps.length - 20} more`)
+      }
+      if (lines.length > 0) {
+        md.appendMarkdown(lines.join('\n') + '\n\n')
+      }
     }
     const comment = sym.getDocComment()
     if (comment !== '') {
@@ -537,7 +579,8 @@ export class CtagsServerComponent
     const unit = macro
       ? undefined
       : vdoc.topSymbols.find((sym) => sym.isValid && sym.getFullRange().contains(position))
-    const text = document.getText()
+    // Perl template markup is not Verilog
+    const text = maskTemplate(document.getText()).text
     const end = unit === undefined ? text.length : document.offsetAt(unit.getFullRange().end)
 
     const highlights: vscode.DocumentHighlight[] = []

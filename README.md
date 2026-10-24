@@ -4,10 +4,11 @@ This fork of the [AndrewNolte Verilog/SystemVerilog extension](https://github.co
 
 - **Hovers** show the declaration, the default value of parameters and object-like macros computed through other parameters, macros, imported packages and `pkg::` references (`= 2048 (0x800)`), the comment above or after the declaration, related parameters, and a link to the file and line.
 - **Go to definition** looks in the enclosing module first, then the rest of the file, then imported packages, so a port such as `clk_i` resolves to one place. Modules, interfaces and packages are found by name even when the file is named differently.
-- **Macros** from `.svh`, `.vh` and other source files are indexed, so `` `NAME `` hovers and jumps to its `` `define ``.
+- **Macros** from `.svh`, `.vh` and other source files are indexed, so `` `NAME `` hovers and jumps to its `` `define ``. The hover of a macro, or of a parameter set from one, lists the macros and parameters its value goes through with their values and places, down to the number or to the name that is not defined. A macro is read where it is used, so a parameter name in its text is looked up in the module of the hover.
 - **Semantic highlighting** colors parameters, ports, signals, instances, types, modules and functions by what the index says they are.
-- **Filelist** support: `verilog.filelist` names the files to index (its sources and the headers in its `+incdir+`/`-I` directories, instead of the workspace globs), the directories for include lookup, the `+define+`/`-D` macros that select the active `` `ifdef `` branches, and is passed to slang with `-f`.
+- **Filelist** support: `verilog.filelist` names the files to index (its sources and the headers in its `+incdir+`/`-I` directories, instead of the workspace globs), the directories for include lookup, the `+define+`/`-D` macros that select the active `` `ifdef `` branches, and is passed to slang with `-f`. Changes to the filelist file are picked up as by Reindex.
 - **Project lint**: with a filelist, slang checks the project once when the first editor opens and after saves (one check for Save All), stopping a check still running; switching editors does not check again. An undefined macro, missing include or unknown module is reported at its first use in each file, with the other uses and the parse errors its missing text causes listed under it. When slang stops at its error limit (20 by default), the filelist shows that later files were not checked.
+- **Perl templates**: Verilog with `<perl>...</perl>` blocks of Perl code and `<pl>...</pl>` Perl expressions is checked without running Perl. Slang reads copies, kept in the extension's storage, where the markup and the Verilog inside Perl loops and ifs (over any number of blocks) are blanked out, with lines and columns unchanged; markup within a line of Verilog becomes a placeholder name. What slang reports about the markup or right after it is dropped, and so are undeclared names in a file with markup, which the markup may declare; their number is shown at the first markup. The index, hovers and highlighting skip the markup, and the editor colors it as Perl.
 - **Uses of a signal** in its module are highlighted under the cursor, assignments and declarations as writes, skipping comments, strings and `.port(` names; F7 and Shift+F7 go to the next and previous use.
 
 Values are computed lexically from defaults; parameter overrides at instantiations are not applied. Ctags runs on the editor text with macro calls blanked out, so a macro inside a port or parameter list no longer hides the rest of the list. A module whose name is itself a macro is not indexed.
@@ -15,7 +16,7 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.3.0.vsix
+code --install-extension verilog-systemverilog-legacy-0.4.0.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.

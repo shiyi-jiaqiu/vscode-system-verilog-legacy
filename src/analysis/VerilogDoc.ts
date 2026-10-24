@@ -5,6 +5,7 @@ import * as path from 'path'
 import * as vscode from 'vscode'
 import { ext } from '../extension'
 import { Logger } from '../lib/logger'
+import { maskTemplate } from '../Template'
 import { Symbol } from './Symbol'
 // select one
 interface SymbolFilter {
@@ -164,7 +165,7 @@ export class VerilogDoc {
       os.tmpdir(),
       `vscode-verilog-${process.pid}-${++ctagsInputCount}${path.extname(this.doc.fileName)}`
     )
-    await fs.promises.writeFile(input, maskMacroCalls(this.doc.getText()))
+    await fs.promises.writeFile(input, maskMacroCalls(maskTemplate(this.doc.getText()).text))
     let args: string[] =
       '-f - --fields=+K --sort=no --excmd=n --fields-SystemVerilog=+{parameter}'.split(' ')
     args.push(...CTAGS_MAPS)

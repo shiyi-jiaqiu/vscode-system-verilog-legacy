@@ -7,6 +7,7 @@ import { ext } from '../extension'
 import { ConfigObject } from '../lib/libconfig'
 import { ToolConfig } from '../lib/runner'
 import { getWorkspaceFolder } from '../utils'
+import { TemplateMirror } from './TemplateMirror'
 
 /// One entry of `slang --diag-json`; lines and columns count from 1, range ends are exclusive
 interface SlangDiagnostic {
@@ -43,11 +44,15 @@ export function lintsProject(): boolean {
 /// Diagnostics by file path, from `slang --diag-json` output. Repeats at the same place (a
 /// header read by each file that includes it) are dropped. Each missing definition is reported
 /// at its first use in a file, with the other uses as related locations, and the parse error
-/// right where the text of an unknown macro was expected goes with that macro.
+/// right where the text of an unknown macro was expected goes with that macro. With `mirror`,
+/// slang read copies with Perl template markup blanked out: what it reports about the markup or
+/// right after it is dropped, and so are undeclared names in a file with markup, which the
+/// markup may declare.
 function toDiagnostics(
   entries: SlangDiagnostic[],
   root: string,
-  unlocated: string
+  unlocated: string,
+  mirror: TemplateMirror | undefined
 ): Map<string, vscode.Diagnostic[]> {
   const files = new Map<string, vscode.Diagnostic[]>()
   const seen = new Set<string>()
@@ -55,7 +60,10 @@ function toDiagnostics(
   const repeats = new Map<vscode.Diagnostic, number>()
   // end of an unknown macro -> its diagnostic
   const macroEnds = new Map<string, vscode.Diagnostic>()
-  const filePath = (file: string) => path.resolve(root, file)
+  // file -> undeclared names left out
+  const undeclared = new Map<string, number>()
+  const filePath = (file: string) =>
+    mirror === undefined ? path.resolve(root, file) : mirror.original(path.resolve(root, file))
   const parse = (entry: SlangDiagnostic): [string, vscode.Range] | undefined => {
     const match = /^(.*):(\d+):(\d+)$/.exec(entry.location ?? '')
     if (match === null) {
@@ -79,6 +87,15 @@ function toDiagnostics(
   for (const entry of entries) {
     const at = parse(entry)
     const [file, range] = at ?? [unlocated, new vscode.Range(0, 0, 0, 0)]
+    if (mirror !== undefined && at !== undefined) {
+      if (mirror.inTemplate(file, range.start.line, range.start.character)) {
+        continue
+      }
+      if (entry.code === 'UndeclaredIdentifier' && mirror.hasMarkup(file)) {
+        undeclared.set(file, (undeclared.get(file) ?? 0) + 1)
+        continue
+      }
+    }
     const key = `${file}:${range.start.line}:${range.start.character}:${entry.code}:${entry.message}`
     if (seen.has(key)) {
       continue
@@ -163,6 +180,16 @@ function toDiagnostics(
   for (const [diag, count] of repeats) {
     diag.message += ` (+${count} more in this file)`
   }
+  for (const [file, count] of undeclared) {
+    const line = mirror!.firstLine(file)
+    const diag = new vscode.Diagnostic(
+      new vscode.Range(line, 0, line, 0),
+      `Not reported: ${count} undeclared name${count === 1 ? '' : 's'}, which the Perl template markup of this file may declare`,
+      vscode.DiagnosticSeverity.Information
+    )
+    diag.source = 'slang'
+    files.set(file, (files.get(file) ?? []).concat(diag))
+  }
   return files
 }
 
@@ -188,6 +215,7 @@ export default class SlangLinter extends ToolConfig {
   private projectRun: child_process.ChildProcess | undefined
   /// counts project checks, so an older one never publishes over a newer one
   private generation = 0
+  private mirror: TemplateMirror | undefined
 
   constructor() {
     super('slang')
@@ -219,29 +247,53 @@ export default class SlangLinter extends ToolConfig {
     }
     const project = lintsProject()
     const filelist = ext.projectFilelist
-    const target = ext.project.top?.definition?.doc.uri ?? doc?.uri
-    let args = ['--diag-json', '-']
-    if (filelist !== undefined) {
-      args.push('-f', filelist.path)
-    } else if (target !== undefined) {
-      args.push('+incdir+' + path.dirname(target.fsPath))
-      if (ext.index.cacheDir !== undefined) {
-        // links to all module files, so slang finds the modules the target uses
-        args.push('-y', ext.index.cacheDir.fsPath)
-      }
-      args.push(target.fsPath)
-    } else {
+    const target = ext.project.top?.definition?.doc.uri.fsPath ?? doc?.uri.fsPath
+    if (filelist === undefined && target === undefined) {
       return
     }
-    args = args.concat(this.args.getValue().split(/\s+/).filter(Boolean))
-    // the check that diagnostics without a place in the code are shown on
-    const unlocated = filelist?.path ?? target!.fsPath
-
     let generation = 0
     if (project) {
       this.projectRun?.kill()
       generation = ++this.generation
     }
+
+    // copies without template markup, when the files have any
+    let mirror: TemplateMirror | undefined
+    const cacheDir = ext.index.cacheDir?.fsPath
+    if (cacheDir !== undefined) {
+      this.mirror = this.mirror ?? new TemplateMirror(path.join(path.dirname(cacheDir), 'template'))
+      const sources = filelist?.files ?? [target!]
+      const incdirs = filelist?.incdirs ?? [path.dirname(target!)]
+      if (await this.mirror.update(sources, incdirs)) {
+        mirror = this.mirror
+      }
+      if (project && generation !== this.generation) {
+        return
+      }
+    }
+    const copy = (file: string) => (mirror === undefined ? file : mirror.copyOf(file))
+    let args = ['--diag-json', '-']
+    if (filelist === undefined) {
+      args.push('+incdir+' + copy(path.dirname(target!)))
+      if (cacheDir !== undefined) {
+        // links to all module files, so slang finds the modules the target uses
+        args.push('-y', cacheDir)
+      }
+      args.push(copy(target!))
+    } else if (mirror === undefined) {
+      args.push('-f', filelist.path)
+    } else {
+      const copied = path.join(mirror.dir, 'filelist.f')
+      const lines = filelist.options.concat(
+        filelist.incdirs.map((dir) => `+incdir+"${mirror!.copyOf(dir)}"`),
+        filelist.files.map((file) => `"${mirror!.copyOf(file)}"`)
+      )
+      await fs.promises.writeFile(copied, lines.join('\n') + '\n')
+      args.push('-f', copied)
+    }
+    args = args.concat(this.args.getValue().split(/\s+/).filter(Boolean))
+    // the check that diagnostics without a place in the code are shown on
+    const unlocated = filelist?.path ?? target!
     const command = this.path.getValue()
     this.logger.info(`running ${command} ${args.join(' ')}`)
     const stdout = await new Promise<string | undefined>((resolve) => {
@@ -286,7 +338,7 @@ export default class SlangLinter extends ToolConfig {
       this.reportFailure(`unreadable diagnostics: ${e}`)
       return
     }
-    const files = toDiagnostics(entries, root, unlocated)
+    const files = toDiagnostics(entries, root, unlocated, mirror)
     if (project && filelist === undefined && ext.index.cacheDir !== undefined) {
       // modules found through -y are reported at their links
       for (const [file, diags] of Array.from(files)) {
