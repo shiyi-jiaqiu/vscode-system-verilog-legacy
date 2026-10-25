@@ -48,7 +48,7 @@ actual editor saves without saving its includer.
 | F02 | Invalidate SourceManager lookup and dependent syntax on disk topology changes; retain editor-owned buffers | Native `.svh`, `.sv`, `.v` delete/create, atomic replace, rename, dirty header ownership |
 | F03 | Reject template trees in metadata/dependency loads; route with effective native includes; rescan open dependency graphs on topology changes | Native unopened template exclusion/recovery; client native-only `-I`, local shadow creation/save and marker removal |
 | F04 | Manual current-version result bypasses the save-only display gate | Client dirty manual Lint with both run-on-save values and further edits |
-| F05 | Request byte columns and translate saved input snapshots to UTF-16 | Real syntax/local/full CLI after Chinese, emoji, tab and combining text; real notes and synthetic multiline ranges |
+| F05 | Request byte columns and translate saved input snapshots to UTF-16 | Real syntax/local/full CLI after Chinese, emoji, tab and combining text; real notes and synthetic multiline ranges; compiler-discovered libraries/includes |
 | F06 | Metadata uses effective preprocessor options and reparses dependents | Native flags, nested filelists, header macros, and headers outside index roots |
 | F07 | Atomically replace index tables and enforce scope for watcher updates | Native shrink/exclude/restore plus out-of-scope source/header events |
 | F08 | Continue dispatching source events while retaining the last valid config | Native malformed JSON, header edits and recovery in a mixed notification |
@@ -59,7 +59,7 @@ actual editor saves without saving its includer.
 | F13 | Convert native hover-link columns through the UTF-16 helper | Native Unicode link target |
 | F14 | Return declaration ranges with workspace symbols | Native second module has its actual line/range |
 | F15 | Cancel startup before lifecycle queueing, bound initialization, terminate child and settle client startup | Client never-replying server: disable, timeout, PID exit, no unhandled rejection, then real native startup |
-| F16 | Cancel/clear on HDL buffer edits; reject changed saved snapshots and dirty input | Client delayed CLI result after an unsaved correction is discarded |
+| F16 | Cancel affected checks and clear affected results on HDL edits; reject changed saved inputs | Client delayed CLI result after an unsaved correction is discarded |
 | F17 | Notify the Raw content provider whenever CLI results change or clear | Client already-open Raw view clears and displays the next clean result |
 | F18 | Supply stable native diagnostic codes and classify missing dependencies by code | Native code; client reading/strict mode missing-include result |
 | F19 | Default omitted completion context to `Invoked` | Native absent and explicit context return the same result; subsequent request succeeds |
@@ -69,3 +69,16 @@ remove the unconditional early return and workspace-changing host restart from
 the former activation test. Environment-specific performance, full elaboration,
 Windows/macOS, external slang-extension coexistence, long sessions and CentOS 7
 release acceptance are outside these focused checks.
+
+## Follow-up review of 4998dac
+
+[Cross-validation and N1–N17 repairs](review2.md) add real-host scope/import/macro,
+CLI isolation, library/include, encoding and lifecycle cases. A fixed, nonempty
+hover golden is enabled. The runner starts with product defaults for run-on-save
+and reading mode; individual suites explicitly select the modes they exercise.
+
+Run `python3 native/tests/review_benchmark.py /path/to/slang-server --check` on an
+otherwise idle host for the bounded native performance fixtures. The command prints
+JSON measurements and fails on the stated broad limits, including exact zero work
+for unrelated creation. Omit `--check` to measure a baseline expected to fail those
+limits. The host suite separately guards block-rich symbol-building latency/scaling.

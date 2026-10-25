@@ -353,6 +353,13 @@
           "description": "Path to slang-server. Empty searches PATH and the directory containing the configured slang executable. Requires a binary compatible with this operating system.",
           "type": "string"
         },
+        "verilog.server.startupTimeout": {
+          "default": 15,
+          "minimum": 1,
+          "maximum": 600,
+          "type": "integer",
+          "description": "Seconds allowed for the native protocol initialization and include-configuration handshake. Workspace indexing follows the handshake and is not part of this timeout."
+        },
         "verilog.lint.slang.args": {
           "default": "",
           "description": "CLI fallback arguments only; native server options belong in .slang/server.json. Examples: `-j 2`, `-Wextra`, `--suppress-warnings ip/**`, `--lint-only`, `--error-limit 100` or `--top name`. Appended after the checkbox options; individual warning flags override warning groups. Do not pass `--diag-json`, which the extension uses to read diagnostics.",

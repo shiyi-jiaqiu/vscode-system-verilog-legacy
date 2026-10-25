@@ -2,8 +2,10 @@
 
 ## Unreleased
 
+- Repair follow-up findings N1–N17: bound scope pairing and native metadata work, target diagnostic/include invalidation, load CLI coordinate data lazily, preserve enum/import/macro discovery, and make startup deadlines configurable. See [cross-validation](native/tests/review2.md).
+
 - Address independent-review findings F01–F19 in the client, static fallback and pinned native patch; see [verification and build instructions](native/tests/README.md).
-- Require the matching `legacy0.6.0-review1` server for effective include configuration and template routing. CLI lint requires byte-column diagnostics and discards stale saved-input results.
+- Require the matching `legacy0.6.0-review2` server for effective include configuration and template routing. CLI lint requires byte-column diagnostics and discards stale saved-input results.
 - Repair the VS Code test entry point, build the manifest bundle before testing, and run in an isolated VS Code 1.84.2 workspace.
 
 - Add file basename and count of children instances in hierarchy view

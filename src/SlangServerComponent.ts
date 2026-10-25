@@ -72,6 +72,16 @@ export class SlangServerComponent extends ExtensionComponent {
     description:
       'Path to slang-server. Empty searches PATH and the directory containing the configured slang executable. Requires a binary compatible with this operating system.',
   })
+  startupTimeout = new ConfigObject<number>({
+    default: 15,
+    minimum: 1,
+    maximum: 600,
+    type: 'integer',
+    description:
+      'Seconds allowed for the native protocol initialization and include-configuration handshake. Workspace indexing follows the handshake and is not part of this timeout.',
+  })
+  private restartTimer: ReturnType<typeof setTimeout> | undefined
+  private fallbackNeedsIndex = false
   readonly dependencies = new SourceDependencies()
   private client: LanguageClient | undefined
   private sent = new Set<string>()
@@ -176,6 +186,7 @@ export class SlangServerComponent extends ExtensionComponent {
     context.subscriptions.push(this.serverOutput)
     const watcher = vscode.workspace.createFileSystemWatcher('**/*.{sv,v,svh,vh}')
     const changed = () => {
+      ext.index.revision++
       clearTimeout(this.headerChange)
       this.headerChange = setTimeout(() => {
         void this.syncDependents().catch((error) => this.logger.error(String(error)))
@@ -231,7 +242,14 @@ export class SlangServerComponent extends ExtensionComponent {
       }),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (this.initialized && event.affectsConfiguration('verilog.server')) {
-          void this.restart()
+          clearTimeout(this.restartTimer)
+          if (!this.enabled.getValue()) {
+            void this.restart()
+          } else {
+            ++this.generation
+            this.cancelStart?.()
+            this.restartTimer = setTimeout(() => void this.restart(), 250)
+          }
         } else if (
           this.initialized &&
           (event.affectsConfiguration('verilog.lint.slang.warnings') ||
@@ -274,6 +292,7 @@ export class SlangServerComponent extends ExtensionComponent {
   }
 
   restart(): Promise<void> {
+    clearTimeout(this.restartTimer)
     const generation = ++this.generation
     // Cancellation must run now, before entering the serialized lifecycle queue.
     this.cancelStart?.()
@@ -283,7 +302,7 @@ export class SlangServerComponent extends ExtensionComponent {
         if (generation !== this.generation) {
           return
         }
-        const wasActive = this.active
+        this.fallbackNeedsIndex ||= this.active
         await this.stop()
         if (generation !== this.generation) {
           return
@@ -425,10 +444,10 @@ export class SlangServerComponent extends ExtensionComponent {
               this.process?.kill('SIGKILL')
               reject(
                 new Error(
-                  'slang-server initialization/include configuration timed out after 15 seconds; use the matching patched server'
+                  `slang-server protocol handshake timed out after ${this.startupTimeout.getValue()} seconds; check the server output or increase verilog.server.startupTimeout`
                 )
               )
-            }, 15000)
+            }, this.startupTimeout.getValue() * 1000)
           })
           try {
             const starting = client.start()
@@ -444,10 +463,15 @@ export class SlangServerComponent extends ExtensionComponent {
             return
           }
           this.state = 'running'
+          this.fallbackNeedsIndex = false
           ext.index.releaseGlobalIndex()
           ext.lint.slang.stop()
           await this.syncDependents()
         } catch (error) {
+          if (generation !== this.generation) {
+            await this.stop()
+            return
+          }
           this.state = 'failed'
           this.logger.error(String(error))
           if (generation === this.generation) {
@@ -457,12 +481,15 @@ export class SlangServerComponent extends ExtensionComponent {
           }
           await this.stop()
         } finally {
-          this.updateBackend()
-          if (!this.active) {
-            if (wasActive) {
-              await ext.indexFiles()
+          if (generation === this.generation) {
+            this.updateBackend()
+            if (!this.active) {
+              if (this.fallbackNeedsIndex) {
+                this.fallbackNeedsIndex = false
+                await ext.indexFiles()
+              }
+              ext.lint.restart()
             }
-            ext.lint.restart()
           }
         }
       })
@@ -625,6 +652,7 @@ export class SlangServerComponent extends ExtensionComponent {
     if (!this.active || !isAnyVerilog(doc.languageId)) {
       return
     }
+    ext.index.revision++
     this.changedSources.add(doc.uri.fsPath)
     clearTimeout(this.headerChange)
     this.headerChange = setTimeout(() => {
@@ -765,6 +793,7 @@ export class SlangServerComponent extends ExtensionComponent {
   }
 
   refreshRawDiagnostics(uri?: vscode.Uri) {
+    this.updateStatus()
     for (const doc of vscode.workspace.textDocuments) {
       if (doc.uri.scheme === 'verilog-diagnostics' && (!uri || doc.uri.query === uri.toString())) {
         this.diagnosticsChanged.fire(doc.uri)
@@ -894,6 +923,7 @@ export class SlangServerComponent extends ExtensionComponent {
             : 'Native shallow analysis; diagnostics match current open .sv/.v versions. Show Raw Diagnostics includes results hidden by reading mode.'
         : this.state === 'external'
           ? 'Built-in server and CLI lint disabled while the external slang extension is installed.'
-          : `Server ${this.state}. Configure verilog.server.path to enable it.`
+          : (ext.lint.slang.statusMessage ??
+            `Server ${this.state}. Configure verilog.server.path to enable it.`)
   }
 }

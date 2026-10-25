@@ -283,6 +283,7 @@ suite('Independent review regressions', function () {
     const doc = await open('range-notes.sv', '中🙂\tstart\n/*e\u0301*/ end\n')
     const inputs = new SavedInputs()
     await inputs.capture([doc.uri.fsPath])
+    await inputs.load([doc.uri.fsPath])
     const diagnostics = toDiagnostics(
       [
         {
@@ -382,6 +383,8 @@ suite('Independent review regressions', function () {
       )
       assert.strictEqual((ext.server as any).state, 'off')
       await fs.promises.unlink(marker)
+      await setting('server.startupTimeout', 2)
+      const timeoutStarted = Date.now()
       await setting('server.enabled', true)
       await until(() => fs.existsSync(marker) && ext.server.pending, 'timeout test started')
       const timeoutPid = Number(await fs.promises.readFile(marker, 'utf8'))
@@ -399,9 +402,11 @@ suite('Independent review regressions', function () {
         }
       }, 'timed-out process exited')
       assert.strictEqual((ext.server as any).state, 'failed')
+      assert.ok(Date.now() - timeoutStarted < 6000, 'configured handshake timeout is used')
       await setting('server.enabled', false)
       await pause(300)
       assert.deepStrictEqual(unhandled, [])
+      await setting('server.startupTimeout', 15)
     } finally {
       process.removeListener('unhandledRejection', rejected)
     }

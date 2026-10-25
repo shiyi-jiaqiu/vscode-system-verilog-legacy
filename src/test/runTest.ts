@@ -30,8 +30,6 @@ async function main() {
         'verilog.server.enabled': false,
         'verilog.ctags.path': ctags,
         'verilog.lint.slang.path': slang,
-        'verilog.lint.slang.runOnSave': false,
-        'verilog.lint.slang.readingMode': false,
       })
     )
     await runTests({

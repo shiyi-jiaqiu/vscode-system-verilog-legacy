@@ -3,7 +3,7 @@
 `slang-server-legacy.patch` applies to upstream
 [60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c),
 with its direct submodules initialized. The resulting server identifies itself as
-`0.3.1+60857ce-legacy0.6.0-review1`. Keep upstream MIT notices.
+`0.3.1+60857ce-legacy0.6.0-review2`. Keep upstream MIT notices.
 
 This revision changes both the client and native service. Rebuild and upgrade both.
 The client waits for `slang/includeConfiguration` after initialization, then uses
@@ -17,7 +17,7 @@ invalidation, template exclusion, preprocessor-aware metadata, index replacement
 configuration-failure recovery, hover links, workspace-symbol ranges, diagnostic
 codes and optional completion context. `diagnosticWarnings` remains an additive
 list of options without `-W`; warning-only refresh reuses analysis. Changes to
-preprocessor definitions or include configuration rebuild metadata as well.
+preprocessor definitions or include configuration rebuild metadata as well. Ordinary metadata parsing avoids include expansion, with full preprocessing for files containing conditional directives, dynamic declarations or macro include paths. Compact header summaries retain template and precise include-candidate dependencies; worker SourceManagers release each primary buffer after extracting metadata. Initial indexing follows `initialized`, after the include-configuration notification, so it does not consume the client handshake timeout. See [follow-up verification](tests/review2.md).
 
 ## Apply and build
 

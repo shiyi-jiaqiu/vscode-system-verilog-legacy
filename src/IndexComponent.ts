@@ -12,6 +12,8 @@ import os = require('os')
 import path = require('path')
 
 export class IndexComponent extends ExtensionComponent {
+  revision = 0
+
   public readonly moduleMap: Map<string, vscode.Uri> = new Map()
 
   // <workspace-specific-dir>/.sv_cache/files, links to the module files for the -y flag of
@@ -56,7 +58,7 @@ export class IndexComponent extends ExtensionComponent {
               affected.has(vdoc.doc.uri.fsPath) ||
               vdoc.importSymbols?.some((symbol) => symbol.doc === event.document)
             ) {
-              vdoc.importSymbols = undefined
+              vdoc.invalidateImports()
             }
           }
         }
@@ -69,7 +71,7 @@ export class IndexComponent extends ExtensionComponent {
           return
         }
         for (const vdoc of this.filemap.values()) {
-          vdoc.importSymbols = undefined
+          vdoc.invalidateImports()
         }
         this.indexFile(doc.uri)
         this.getVerilogDoc(doc).clearSymbols()
@@ -106,6 +108,7 @@ export class IndexComponent extends ExtensionComponent {
   }
 
   releaseGlobalIndex() {
+    this.revision++
     this.moduleMap.clear()
     this.unitKinds.clear()
     this.macroFiles.clear()
@@ -256,6 +259,7 @@ export class IndexComponent extends ExtensionComponent {
       }
       count++
     }
+    this.revision++
     this.logger.info(`indexed ${count} unit and macro names in ${files.length} files`)
   }
 
@@ -267,14 +271,28 @@ export class IndexComponent extends ExtensionComponent {
     if (local.length > 0) {
       return local
     }
-    const found: Symbol[] = []
-    const candidates = (await this.dependencyDocuments(document)).map((doc) => doc.uri)
-    for (const uri of candidates) {
-      const doc = await vscode.workspace.openTextDocument(uri)
-      const syms = await this.getVerilogDoc(doc).getSymbols({ name }, false)
-      found.push(...syms.filter((sym) => sym.isMacro()))
+    const closure = await this.dependencyDocuments(document)
+    const search = async (uris: vscode.Uri[]) => {
+      const found: Symbol[] = []
+      for (const uri of uris) {
+        const doc = await vscode.workspace.openTextDocument(uri).then(
+          (doc) => doc,
+          () => undefined
+        )
+        if (doc) {
+          found.push(
+            ...(await this.getVerilogDoc(doc).getSymbols({ name }, false)).filter((sym) =>
+              sym.isMacro()
+            )
+          )
+        }
+      }
+      return found
     }
-    return found
+    const found = await search(closure.map((doc) => doc.uri))
+    return found.length
+      ? found
+      : search(this.macroFiles.get(name) ?? this.headerFiles.get(name) ?? [])
   }
 
   /// Tags of `files` from one ctags process, one per line
@@ -383,10 +401,9 @@ export class IndexComponent extends ExtensionComponent {
   /// Top level symbols named `name` in the headers
   async findHeaderSymbols(name: string, document?: vscode.TextDocument): Promise<Symbol[]> {
     const found: Symbol[] = []
-    const candidates =
-      document
-        ? (await this.dependencyDocuments(document)).map((doc) => doc.uri)
-        : (this.headerFiles.get(name) ?? [])
+    const candidates = document
+      ? (await this.dependencyDocuments(document)).map((doc) => doc.uri)
+      : (this.headerFiles.get(name) ?? [])
     for (const uri of candidates) {
       let doc: vscode.TextDocument
       try {
@@ -397,6 +414,9 @@ export class IndexComponent extends ExtensionComponent {
       }
       const syms = await this.getVerilogDoc(doc).getSymbols({ name })
       found.push(...syms.filter((sym) => sym.parentScope === ''))
+    }
+    if (!found.length && document) {
+      return this.findHeaderSymbols(name)
     }
     return found
   }
@@ -473,7 +493,7 @@ export class IndexComponent extends ExtensionComponent {
       return []
     }
     return (await doc.getSymbols({ name: targetText }, false)).filter(
-      (sym) => sym.parentScope === moduleName || (sym.name === moduleName && !sym.parentScope)
+      (sym) => doc.memberScope(sym) === moduleName || (sym.name === moduleName && !sym.parentScope)
     )
   }
 

@@ -79,7 +79,9 @@ export class VerilogDoc {
   private logger: Logger
   private parsing: Promise<void> | undefined
   private parsedVersion = -1
-  private importsComplete = true
+  private importing: Promise<{ symbols: Symbol[]; scopes: Map<Symbol, Set<string>> }> | undefined
+  private importsRevision = -1
+  private importsGeneration = 0
   private importedScopes = new Map<Symbol, Set<string>>()
 
   constructor(logger: Logger, document: vscode.TextDocument) {
@@ -93,6 +95,21 @@ export class VerilogDoc {
 
   clearSymbols() {
     this.isDirty = true
+    this.invalidateImports()
+  }
+
+  invalidateImports() {
+    this.importSymbols = undefined
+    this.importing = undefined
+    this.importsGeneration++
+  }
+
+  /// Enum literals are declared in the surrounding scope, although ctags attaches
+  /// them to their typedef for outline grouping.
+  memberScope(sym: Symbol): string {
+    return sym.type === 'constant' && sym.parentType === 'typedef'
+      ? sym.parentScope.split('.').slice(0, -1).join('.')
+      : sym.parentScope
   }
 
   async getSymbols(filter: SymbolFilter = {}, addImports = true): Promise<Symbol[]> {
@@ -108,7 +125,7 @@ export class VerilogDoc {
           }
           await this.buildSymbolsList(output)
           this.parsedVersion = version
-          this.importSymbols = undefined
+          this.invalidateImports()
         })().finally(() => {
           this.parsing = undefined
         })
@@ -116,29 +133,38 @@ export class VerilogDoc {
       await this.parsing
     }
     if (addImports) {
+      const revision = ext.index.revision
+      if (this.importsRevision !== revision) {
+        this.invalidateImports()
+        this.importsRevision = revision
+      }
       if (this.importSymbols === undefined) {
-        const imports = await this.parseImports()
-        // Native metadata can still be indexing on the first outline / hover request.
-        // Retry unresolved imports on demand instead of caching a permanent miss.
-        this.importSymbols = this.importsComplete ? imports : undefined
-        return filterSymbols(this.symbols.concat(imports), filter)
+        const generation = this.importsGeneration
+        const pending = (this.importing ??= this.parseImports())
+        const imported = await pending
+        if (
+          generation !== this.importsGeneration ||
+          revision !== ext.index.revision ||
+          this.parsedVersion !== this.doc.version
+        ) {
+          return this.getSymbols(filter, addImports)
+        }
+        // Publish both halves atomically. Cache misses until input/index invalidation,
+        // and let concurrent requests await the same resolution work.
+        this.importSymbols = imported.symbols
+        this.importedScopes = imported.scopes
       }
       return filterSymbols(this.symbols.concat(this.importSymbols), filter)
     }
     return filterSymbols(this.symbols, filter)
   }
 
-  async parseImports(): Promise<Symbol[]> {
-    this.importsComplete = true
-    this.importedScopes.clear()
-    const symbols: Symbol[] = []
+  private async parseImports(): Promise<{ symbols: Symbol[]; scopes: Map<Symbol, Set<string>> }> {
+    const scopes = new Map<Symbol, Set<string>>()
     const add = (sym: Symbol, scope: string) => {
-      const scopes = this.importedScopes.get(sym) ?? new Set<string>()
-      scopes.add(scope)
-      this.importedScopes.set(sym, scopes)
-      if (!symbols.includes(sym)) {
-        symbols.push(sym)
-      }
+      const visible = scopes.get(sym) ?? new Set<string>()
+      visible.add(scope)
+      scopes.set(sym, visible)
     }
     const text = maskTemplate(this.doc.getText()).text.replace(
       /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g,
@@ -148,13 +174,13 @@ export class VerilogDoc {
     for (const match of text.matchAll(importRe)) {
       const doc = await ext.index.findFile(match[1])
       if (!doc) {
-        this.importsComplete = false
         continue
       }
       const scope = this.scopeAt(this.doc.positionAt(match.index!)) ?? ''
-      const members = await ext.index.getVerilogDoc(doc).getSymbols({}, false)
+      const imported = ext.index.getVerilogDoc(doc)
+      const members = await imported.getSymbols({}, false)
       for (const sym of members) {
-        if (sym.parentScope === match[1] && (match[2] === '*' || sym.name === match[2])) {
+        if (imported.memberScope(sym) === match[1] && (match[2] === '*' || sym.name === match[2])) {
           add(sym, scope)
         }
       }
@@ -165,12 +191,12 @@ export class VerilogDoc {
         continue
       }
       for (const sym of await dependency.getSymbols({}, false)) {
-        if (sym.parentScope === '') {
+        if (dependency.memberScope(sym) === '') {
           add(sym, '')
         }
       }
     }
-    return symbols
+    return { symbols: [...scopes.keys()], scopes }
   }
 
   async getModules(): Promise<Symbol[]> {
@@ -293,20 +319,50 @@ export class VerilogDoc {
             (part) => part.replace(/[^\r\n]/g, ' ')
           )
           const frames: { kind: string; symbol?: Symbol; start: number }[] = []
+          const byKind = new Map<string, Symbol[]>()
+          for (const symbol of this.symbols) {
+            const list = byKind.get(symbol.type) ?? []
+            list.push(symbol)
+            byKind.set(symbol.type, list)
+          }
+          const cursors = new Map<string, number>()
           const delimiters =
             /\b(module|interface|package|program|class|function|task|checker|clocking|generate|begin|end(?:module|interface|package|program|class|function|task|checker|clocking|generate)?)\b/g
           for (const match of text.matchAll(delimiters)) {
             const token = match[0]
-            const position = this.doc.positionAt(match.index!)
             if (!token.startsWith('end')) {
               const kind = token === 'begin' ? 'block' : token
-              const symbol = this.symbols.find(
-                (sym) => sym.type === kind && sym.line === position.line
-              )
+              let symbol: Symbol | undefined
+              // Unnamed blocks have no tag. Named declarations consume an ordered
+              // per-kind cursor, so each tag is examined at most once, including
+              // names on later lines of a function/task header.
+              if (
+                kind !== 'block' ||
+                /^\s*:\s*\w+/.test(
+                  text.slice(match.index! + token.length, match.index! + token.length + 256)
+                )
+              ) {
+                const line = this.doc.positionAt(match.index!).line
+                const end = text.indexOf(';', match.index!)
+                const lastLine =
+                  kind === 'block' ? line : this.doc.positionAt(end < 0 ? text.length : end).line
+                const candidates = byKind.get(kind) ?? []
+                let cursor = cursors.get(kind) ?? 0
+                while (cursor < candidates.length && candidates[cursor].line < line) {
+                  cursor++
+                }
+                if (cursor < candidates.length && candidates[cursor].line <= lastLine) {
+                  symbol = candidates[cursor++]
+                }
+                cursors.set(kind, cursor)
+              }
               frames.push({ kind, symbol, start: match.index! })
             } else {
               const kind = token === 'end' ? 'block' : token.slice(3)
-              const index = frames.map((frame) => frame.kind).lastIndexOf(kind)
+              let index = frames.length - 1
+              while (index >= 0 && frames[index].kind !== kind) {
+                index--
+              }
               if (index < 0) {
                 continue
               }
@@ -318,7 +374,7 @@ export class VerilogDoc {
                 )
                 frame.symbol.isValid = true
               }
-              frames.splice(index)
+              frames.length = index
             }
           }
         }
@@ -406,7 +462,7 @@ export class VerilogDoc {
     let scope = unit ?? ''
     for (;;) {
       const local = new Map<string, Symbol[]>()
-      for (const sym of own.filter((sym) => sym.parentScope === scope)) {
+      for (const sym of own.filter((sym) => this.memberScope(sym) === scope)) {
         local.set(sym.name, [...(local.get(sym.name) ?? []), sym])
       }
       const imported = new Map<string, Set<Symbol>>()

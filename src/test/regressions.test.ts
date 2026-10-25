@@ -21,6 +21,9 @@ suite('Review regressions', function () {
     await vscode.workspace
       .getConfiguration('verilog')
       .update('lint.slang.runOnSave', false, vscode.ConfigurationTarget.Workspace)
+    await vscode.workspace
+      .getConfiguration('verilog')
+      .update('lint.slang.readingMode', false, vscode.ConfigurationTarget.Workspace)
     await pause(1000)
   })
 

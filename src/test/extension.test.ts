@@ -8,6 +8,14 @@ suite('Extension activation', () => {
     await extension.activate()
     assert.ok(extension.isActive)
     assert.strictEqual(vscode.version, '1.84.2')
+    assert.strictEqual(
+      vscode.workspace.getConfiguration('verilog').get('lint.slang.runOnSave'),
+      true
+    )
+    assert.strictEqual(
+      vscode.workspace.getConfiguration('verilog').get('lint.slang.readingMode'),
+      true
+    )
     assert.ok((await vscode.commands.getCommands()).includes('verilog.lint.run'))
     console.log(`Verified extension ${extension.extensionPath} @ ${extension.packageJSON.version}`)
   })

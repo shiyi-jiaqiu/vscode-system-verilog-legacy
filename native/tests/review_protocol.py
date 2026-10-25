@@ -319,4 +319,68 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertTrue(s.hover('small.sv', 0, 19))
 
+    def test_N08_N09_unrelated_topology_and_same_name_headers_are_targeted(self):
+        self.config()
+        for i in range(20):
+            self.write(f'ip{i}/defs.svh', '`define WIDTH 8\n')
+            self.write(f'ip{i}/top.sv', f'`include "defs.svh"\nmodule top{i}; localparam int W=`WIDTH; endmodule\n')
+        s = self.start()
+        for i in range(20): s.open(f'ip{i}/top.sv')
+        before = (self.root / 'server.stderr').read_text().count('Analyzed ')
+        self.write('unrelated.sv', 'module unrelated; endmodule\n')
+        s.watched(('unrelated.sv', 1))
+        self.assertEqual((self.root / 'server.stderr').read_text().count('Analyzed '), before)
+        self.write('ip0/defs.svh', '`define WIDTH 16\n')
+        s.watched(('ip0/defs.svh', 2))
+        log = (self.root / 'server.stderr').read_text()
+        self.assertEqual(log.count('Analyzed ') - before, 1)
+        self.assertIn('Refreshing metadata for 2 files', log)
+        self.assertRegex(s.hover('ip0/top.sv', 1, 28), r'\b16\b')
+        self.assertRegex(s.hover('ip1/top.sv', 1, 28), r'\b8\b')
+
+    def test_N15_scope_checks_ignore_ancestors_and_globs_match_new_paths(self):
+        self.config(index=[{'dirs':['rtl'], 'excludeDirs':[self.root.name, self.root.parent.name]}])
+        self.write('rtl/old.sv', 'module old; endmodule\n')
+        s = self.start()
+        self.write('rtl/fresh.sv', 'module fresh; endmodule\n')
+        s.watched(('rtl/fresh.sv', 1))
+        self.assertEqual(self.names(), {'old', 'fresh'})
+        self.config(index=[], indexGlobs=[str(self.root/'rtl/*.sv')])
+        s.watched(('.slang/server.json', 2))
+        self.write('rtl/new.sv', 'module newest; endmodule\n')
+        self.write('rtl/child/hidden.sv', 'module hidden; endmodule\n')
+        s.watched(('rtl/new.sv', 1), ('rtl/child/hidden.sv', 1))
+        self.assertEqual(self.names(), {'old', 'fresh', 'newest'})
+
+    def test_N14_oversized_incremental_column_clamps_without_losing_next_edit(self):
+        self.config()
+        self.write('top.sv', 'module old; endmodule // 🙂\n')
+        s = self.start(); s.open('top.sv')
+        s.notify('textDocument/didChange', {
+            'textDocument': {'uri':s.uri('top.sv'), 'version':2},
+            'contentChanges':[
+                {'range':{'start':{'line':0,'character':999},'end':{'line':0,'character':999}},'text':' appended'},
+                {'range':{'start':{'line':0,'character':7},'end':{'line':0,'character':10}},'text':'fresh'}]})
+        symbols=s.request('textDocument/documentSymbol', {'textDocument':{'uri':s.uri('top.sv')}})
+        self.assertEqual(symbols[0]['name'], 'fresh')
+        self.assertNotIn('Error handling notification', (self.root/'server.stderr').read_text())
+
+    def test_N02_lightweight_index_distinguishes_comment_and_macro_includes(self):
+        self.config()
+        self.write('template.svh', 'parameter int <pl>$name</pl> = 1;\n')
+        self.write('comment.sv', '// `include "template.svh"\nmodule comment_ok; endmodule\n')
+        self.write('macro.sv', '`define HEADER "template.svh"\n`include `HEADER\nmodule hidden; endmodule\n')
+        self.write('names.svh', '`define UNIT expanded_name\n')
+        self.write('named.sv', '`include "names.svh"\nmodule `UNIT; endmodule\n')
+        self.write('child.sv', 'module child; endmodule\n')
+        self.write('guard.svh', '`define ENABLE_CHILD\n')
+        self.write('guarded-use.sv', '`include "guard.svh"\nmodule guarded_use;\n`ifdef ENABLE_CHILD\nchild inst();\n`endif\nendmodule\n')
+        s = self.start()
+        self.assertIn('comment_ok', self.names())
+        self.assertIn('expanded_name', self.names())
+        self.assertNotIn('hidden', self.names())
+        s.open('child.sv')
+        references = s.request('textDocument/references', {**s.at('child.sv', 0, 8), 'context':{'includeDeclaration':True}})
+        self.assertIn(s.uri('guarded-use.sv'), {item['uri'] for item in references})
+
 if __name__ == '__main__': unittest.main(verbosity=2)

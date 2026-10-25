@@ -259,11 +259,27 @@ export class CtagsServerComponent
       const symbols = (
         await Promise.all(docs.map((doc) => ext.index.getVerilogDoc(doc).getSymbols({}, false)))
       ).flat()
-      return symbols
-        .filter((symbol) => symbol.isMacro())
-        .map((symbol) =>
-          macroCompletionItem(symbol.name, symbol.type, symbol.doc.lineAt(symbol.line).text)
-        )
+      const items = new Map<string, vscode.CompletionItem>()
+      for (const symbol of symbols.filter((symbol) => symbol.isMacro())) {
+        if (!items.has(symbol.name)) {
+          items.set(
+            symbol.name,
+            macroCompletionItem(symbol.name, symbol.type, symbol.doc.lineAt(symbol.line).text)
+          )
+        }
+      }
+      // Global candidates remain useful when the project's compile order or include
+      // paths are incomplete; resolved local definitions keep priority.
+      for (const name of new Set([
+        ...ext.index.macroFiles.keys(),
+        ...ext.index.headerMacros.keys(),
+      ])) {
+        if (!items.has(name)) {
+          const cached = ext.index.headerMacros.get(name)
+          items.set(name, macroCompletionItem(name, cached?.[0] ?? 'define', cached?.[1] ?? ''))
+        }
+      }
+      return [...items.values()]
     }
 
     // Builtin Completion
@@ -284,7 +300,9 @@ export class CtagsServerComponent
         this.logger.info('Package not found')
         return []
       }
-      symbols = (await ctags.getPackageSymbols()).filter((sym) => sym.parentScope === pkgName)
+      symbols = (await ctags.getPackageSymbols()).filter(
+        (sym) => ctags.memberScope(sym) === pkgName
+      )
       this.logger.info(`Found ${symbols.length} completions in package ${pkgName}`)
     } else if (context.triggerCharacter === '.') {
       let parentScope = getParentText(document, new vscode.Range(position, position))
