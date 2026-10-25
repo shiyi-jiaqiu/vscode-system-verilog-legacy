@@ -1,44 +1,57 @@
-# Native server for extension 0.6.0
+# Native server for the 0.6.0 review fixes
 
 `slang-server-legacy.patch` applies to upstream
-[60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c).
-The resulting version is `0.3.1+60857ce-legacy0.6.0`. Keep upstream MIT notices.
-This patch is required alongside the 0.6.0 VSIX for versioned diagnostics.
+[60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c),
+with its direct submodules initialized. The resulting server identifies itself as
+`0.3.1+60857ce-legacy0.6.0-review1`. Keep upstream MIT notices.
 
-The patch selects LSP's mandatory UTF-16 encoding at every position boundary,
-retains document versions in diagnostics and inactive-region notifications,
-and separates diagnostic refresh from metadata indexing. `diagnosticWarnings`
-is an additive list of warning options without `-W`. The extension supplies a
-complete set of positive/negative checkbox options. Changing the same set
-refreshes cached diagnostics; removing groups or changing other compiler
-settings rebuilds their mappings. Existing native flags remain in effect.
+This revision changes both the client and native service. Rebuild and upgrade both.
+The client waits for `slang/includeConfiguration` after initialization, then uses
+those effective directories and include-search policies to route literal template
+dependencies. Older binaries without that notification fall back after the startup
+timeout. No Perl code is executed.
 
-## Build
+The patch retains mandatory UTF-16 positions and versioned diagnostics from the
+original 0.6.0 patch. It additionally repairs live reference candidates, disk include
+invalidation, template exclusion, preprocessor-aware metadata, index replacement,
+configuration-failure recovery, hover links, workspace-symbol ranges, diagnostic
+codes and optional completion context. `diagnosticWarnings` remains an additive
+list of options without `-W`; warning-only refresh reuses analysis. Changes to
+preprocessor definitions or include configuration rebuild metadata as well.
 
-Check out the pinned upstream commit and initialize its direct submodules,
-then apply this patch with `git apply`. Use CMake 3.28+ and a C++20 compiler.
-For CentOS 7, the compiler must target glibc 2.17; a modern host compiler alone
-does not establish that compatibility. The supplied Linux x86_64 build used
-GCC 11.4 with a glibc 2.17 sysroot and these CMake options:
+## Apply and build
+
+Initialize the pinned checkout's **direct** submodules before applying the patch.
+The patch also modifies two files inside `external/slang`; apply it from the
+server root with ordinary `git apply`, without `--index` or `--3way`.
 
 ```sh
-cmake -S slang-server -B slang-server-build -G Ninja \
+git checkout 60857ce8b4a01b6d11443fb1af1eb41c261c702c
+git submodule update --init
+git apply --check /path/to/verilog-legacy/native/slang-server-legacy.patch
+git apply /path/to/verilog-legacy/native/slang-server-legacy.patch
+cmake -S . -B ../slang-server-build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_COMPILER=/path/to/glibc217-toolchain/bin/x86_64-conda-linux-gnu-g++ \
   -DSLANG_SERVER_STATIC_LINK_STDLIB=ON \
-  -DSLANG_SERVER_INCLUDE_TESTS=OFF \
+  -DSLANG_SERVER_INCLUDE_TESTS=ON \
   -DREFLECTCPP_USE_VCPKG=OFF
-cmake --build slang-server-build --target slang_server -j 4
+cmake --build ../slang-server-build --target slang_server server_unittests -j 3
 ```
 
-CMake's pinned dependency revisions are supplied by upstream. Existing source
-caches can be reused with `FETCHCONTENT_SOURCE_DIR_FMT`,
-`FETCHCONTENT_SOURCE_DIR_BOOST_REGEX` and `FETCHCONTENT_SOURCE_DIR_TOMLPLUSPLUS`.
-The binary is `slang-server-build/bin/slang-server`.
+Use CMake 3.28+ and a C++20 compiler. The binary is
+`slang-server-build/bin/slang-server`. CMake's pinned dependency revisions come
+from upstream; existing caches can be supplied through the usual
+`FETCHCONTENT_SOURCE_DIR_*` options. See [regression instructions](tests/README.md).
 
-Verify ELF symbol versions with `readelf --version-info`; this build requires
-at most GLIBC_2.17 and links the C++ runtime statically. Actual LSP requests
-were also checked under a CentOS 7 userspace with VS Code 1.84.2: Unicode
-positions and rename ranges, current-version diagnostics, inactive branches,
-warning toggles, filelist reloads, template routing, and native/fallback
-transitions. That userspace check uses the host kernel, not a CentOS 7 VM.
+## Target ABI
+
+The modern Linux build used to validate these fixes is a development artifact,
+not a CentOS 7 release binary. Static C++ runtimes alone do not establish glibc
+2.17 compatibility. The previous offline kit predates these fixes and cannot be
+used to validate this source revision.
+
+A CentOS 7 release still needs a glibc 2.17 toolchain/sysroot build, SHA256 and build
+records, ELF symbol/dependency checks on that exact binary, and its protocol and
+VS Code 1.84.2 tests in the target environment. Keep container/userspace results
+separate from a complete CentOS 7 VM. Include the actual offline package's third
+party license notices. No new target-ABI acceptance is claimed by this patch.

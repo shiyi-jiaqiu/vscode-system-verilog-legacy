@@ -210,7 +210,7 @@ export class IndexComponent extends ExtensionComponent {
             const text = await fs.promises.readFile(file.fsPath, 'utf8')
             if (hasTemplate(text)) {
               const copy = path.join(temp, `${i + j}${path.extname(file.fsPath)}`)
-              await fs.promises.writeFile(copy, maskTemplate(text).text)
+              await fs.promises.writeFile(copy, maskTemplate(text, true).text)
               inputs[i + j] = copy
               originals.set(copy, file.fsPath)
             }
@@ -240,7 +240,7 @@ export class IndexComponent extends ExtensionComponent {
     let count = 0
     for (const line of stdout.split(/\r?\n/)) {
       const [name, file, , kind] = line.split('\t')
-      if (kind === undefined) {
+      if (kind === undefined || name === '_') {
         continue
       }
       const uri = vscode.Uri.file(originals.get(file) ?? file)
@@ -268,9 +268,7 @@ export class IndexComponent extends ExtensionComponent {
       return local
     }
     const found: Symbol[] = []
-    const candidates = ext.server.active
-      ? (await this.dependencyDocuments(document)).map((doc) => doc.uri)
-      : (this.macroFiles.get(name) ?? [])
+    const candidates = (await this.dependencyDocuments(document)).map((doc) => doc.uri)
     for (const uri of candidates) {
       const doc = await vscode.workspace.openTextDocument(uri)
       const syms = await this.getVerilogDoc(doc).getSymbols({ name }, false)
@@ -326,7 +324,7 @@ export class IndexComponent extends ExtensionComponent {
                     const text = await fs.promises.readFile(file.fsPath, 'utf8').catch(() => '')
                     await fs.promises.writeFile(
                       copies[i + j],
-                      maskMacroCalls(maskTemplate(text).text)
+                      maskMacroCalls(maskTemplate(text, true).text)
                     )
                   })
                 )
@@ -386,7 +384,7 @@ export class IndexComponent extends ExtensionComponent {
   async findHeaderSymbols(name: string, document?: vscode.TextDocument): Promise<Symbol[]> {
     const found: Symbol[] = []
     const candidates =
-      ext.server.active && document
+      document
         ? (await this.dependencyDocuments(document)).map((doc) => doc.uri)
         : (this.headerFiles.get(name) ?? [])
     for (const uri of candidates) {
@@ -407,12 +405,13 @@ export class IndexComponent extends ExtensionComponent {
   async dependencyDocuments(document: vscode.TextDocument): Promise<vscode.TextDocument[]> {
     await ext.server.dependencies.update(
       [document.uri.fsPath],
-      ext.projectFilelist?.incdirs ?? [],
+      ext.server.includeDirectories,
       new Map(
         vscode.workspace.textDocuments
           .filter((doc) => doc === document || doc.isDirty)
           .map((doc) => [doc.uri.fsPath, doc.getText()])
-      )
+      ),
+      ext.server.includePolicy
     )
     const docs: vscode.TextDocument[] = []
     for (const file of ext.server.dependencies.dependenciesOf(document.uri.fsPath)) {
@@ -473,7 +472,9 @@ export class IndexComponent extends ExtensionComponent {
     if (doc === undefined) {
       return []
     }
-    return await doc.getSymbols({ name: targetText })
+    return (await doc.getSymbols({ name: targetText }, false)).filter(
+      (sym) => sym.parentScope === moduleName || (sym.name === moduleName && !sym.parentScope)
+    )
   }
 
   /// Finds a symbols definition, but also looks in targetText.sv to get module/interface defs
@@ -490,7 +491,7 @@ export class IndexComponent extends ExtensionComponent {
     // symbol tree first, unitAt needs it
     let symPromise = verilogDoc
       .getSymbolTree()
-      .then(() => verilogDoc.findVisible(targetText, verilogDoc.unitAt(position)))
+      .then(() => verilogDoc.findVisible(targetText, verilogDoc.scopeAt(position)))
 
     let parentScope = getParentText(document, textRange)
     // let modulePromise = this.findDefinitionByName(parentScope, targetText);
@@ -518,10 +519,9 @@ export class IndexComponent extends ExtensionComponent {
       this.moduleMap.has(parentScope)
     ) {
       // find parentScope.sv of parentScope::targetText
-      let sym = (await this.findDefinitionByName(parentScope, targetText)).at(0)
-      // Sometimes package::x is found multiple times, return just the top level package
-      if (sym !== undefined) {
-        return [sym]
+      const symbols = await this.findDefinitionByName(parentScope, targetText)
+      if (symbols.length > 0) {
+        return symbols
       }
     }
     const local = (await symPromise).filter(

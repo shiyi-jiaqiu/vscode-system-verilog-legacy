@@ -83,9 +83,9 @@ async function findConstant(
   const syms =
     pkg !== undefined
       ? await ext.index.findDefinitionByName(pkg, name)
-      : await ext.index.getVerilogDoc(scope.doc).getSymbols({ name })
+      : await ext.index.getVerilogDoc(scope.doc).findVisible(name, scope.parentScope)
   const consts = syms.filter((sym) => sym.isConstant())
-  return consts.find((sym) => sym.parentScope === scope.parentScope) ?? consts[0]
+  return consts.length === 1 ? consts[0] : undefined
 }
 
 /// A parameter or macro that a value is computed through
@@ -144,22 +144,36 @@ async function substitute(
     }
     let value: string | undefined
     if (tick === '`') {
-      const macro = (await ext.index.findMacro(site?.doc.doc ?? scope.doc, first))[0]
+      const macros = await ext.index.findMacro(site?.doc.doc ?? scope.doc, first)
+      const macro = macros.length === 1 ? macros[0] : undefined
       step.sym = macro
       step.text =
-        macro !== undefined ? getMacroBody(macro) : ext.projectFilelist?.defines.get(first)
+        macro !== undefined
+          ? getMacroBody(macro)
+          : macros.length === 0
+            ? ext.projectFilelist?.defines.get(first)
+            : undefined
       if (step.text !== undefined && step.text !== '') {
         // a macro's text is read where it is used
-        value = await substitute(step.text, macro ?? scope, depth + 1, site, recorded ? [] : steps)
+        value = await substitute(
+          step.text,
+          macro ?? scope,
+          depth + 1,
+          site ?? { doc: ext.index.getVerilogDoc(scope.doc), unit: scope.parentScope },
+          recorded ? [] : steps
+        )
       }
     } else {
       const visible =
         second === undefined && site !== undefined
-          ? (await site.doc.findVisible(first, site.unit)).find((sym) => sym.isConstant())
+          ? (await site.doc.findVisible(first, site.unit)).filter((sym) => sym.isConstant())
           : undefined
       const sym =
-        visible ??
-        (await findConstant(scope, second ?? first, second === undefined ? undefined : first))
+        visible !== undefined
+          ? visible.length === 1
+            ? visible[0]
+            : undefined
+          : await findConstant(scope, second ?? first, second === undefined ? undefined : first)
       step.sym = sym
       step.text = sym && getDeclValueText(sym)
       // a parameter's value is read where it is declared
@@ -168,7 +182,8 @@ async function substitute(
     }
     step.value = value === undefined ? undefined : evalConst(value)
     failed = failed || value === undefined
-    out += '(' + value + ')'
+    // Macros substitute tokens, not a parenthesized value: `ADD*3 with ADD=1+2 is 7.
+    out += tick === '`' ? value : '(' + value + ')'
   }
   return failed ? undefined : out + expr.slice(last)
 }
@@ -353,25 +368,25 @@ export function evalConst(expr: string): bigint | undefined {
       const v = unary()
       return integer(t === '-' ? -v : t === '+' ? v : t === '!' ? BigInt(v === 0n) : ~v)
     }
-    return power()
+    return primary()
   }
 
   const power = (): bigint => {
-    const base = primary()
-    if (peek() === '**') {
+    let base = unary()
+    while (peek() === '**') {
       pos++
       const exp = unary()
       if (exp < 0n || exp > 31n) {
         throw new Error('exponent requires sizing')
       }
-      return integer(base ** exp)
+      base = integer(base ** exp)
     }
     return base
   }
 
   const level = (n: number): bigint => {
     if (n === LEVELS.length) {
-      return unary()
+      return power()
     }
     let v = level(n + 1)
     while (typeof peek() === 'string' && LEVELS[n].includes(peek() as string)) {

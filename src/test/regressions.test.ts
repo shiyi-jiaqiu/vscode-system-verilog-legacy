@@ -26,6 +26,8 @@ suite('Review regressions', function () {
 
   suiteTeardown(async () => {
     ext.lint.slang.stop()
+    await vscode.workspace.saveAll(false)
+    await vscode.commands.executeCommand('workbench.action.closeAllEditors')
     await fs.promises.rm(dir, { recursive: true, force: true })
   })
 

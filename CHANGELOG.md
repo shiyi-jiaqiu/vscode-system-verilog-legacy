@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Address independent-review findings F01–F19 in the client, static fallback and pinned native patch; see [verification and build instructions](native/tests/README.md).
+- Require the matching `legacy0.6.0-review1` server for effective include configuration and template routing. CLI lint requires byte-column diagnostics and discards stale saved-input results.
+- Repair the VS Code test entry point, build the manifest bundle before testing, and run in an isolated VS Code 1.84.2 workspace.
+
 - Add file basename and count of children instances in hierarchy view
 
 ## [25.0.0]

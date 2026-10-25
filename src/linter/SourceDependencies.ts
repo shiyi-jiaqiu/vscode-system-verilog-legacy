@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 import * as fs from 'fs'
+import * as path from 'path'
 import { includeCandidates } from '../Filelist'
 import { hasTemplate } from '../Template'
 
@@ -10,6 +11,11 @@ interface Entry {
   template: boolean
 }
 
+export interface IncludePolicy {
+  disableLocalIncludes?: boolean
+  incDirFirst?: boolean
+}
+
 /// Metadata only: never invent compiler input for unexpanded templates.
 export class SourceDependencies {
   private entries = new Map<string, Entry>()
@@ -18,9 +24,12 @@ export class SourceDependencies {
   update(
     sources: string[],
     incdirs: string[],
-    buffers: ReadonlyMap<string, string> = new Map()
+    buffers: ReadonlyMap<string, string> = new Map(),
+    policy: IncludePolicy = {}
   ): Promise<Set<string>> {
-    const result = this.queue.catch(() => {}).then(() => this.scan(sources, incdirs, buffers))
+    const result = this.queue
+      .catch(() => {})
+      .then(() => this.scan(sources, incdirs, buffers, policy))
     this.queue = result
     return result
   }
@@ -28,7 +37,8 @@ export class SourceDependencies {
   private async scan(
     sources: string[],
     incdirs: string[],
-    buffers: ReadonlyMap<string, string>
+    buffers: ReadonlyMap<string, string>,
+    policy: IncludePolicy
   ): Promise<Set<string>> {
     const seen = new Set(sources)
     const queue = [...seen]
@@ -46,11 +56,11 @@ export class SourceDependencies {
     for (let i = 0; i < queue.length; i++) {
       const file = queue[i]
       const info = await stat(file)
-      if (!info?.isFile()) {
+      if (!buffers.has(file) && !info?.isFile()) {
         this.entries.delete(file)
         continue
       }
-      const stamp = `${info.mtimeMs}:${info.ctimeMs}:${info.size}`
+      const stamp = info ? `${info.mtimeMs}:${info.ctimeMs}:${info.size}` : ''
       let entry = this.entries.get(file)
       if (buffers.has(file) || entry?.stamp !== stamp) {
         const text = buffers.get(file) ?? (await fs.promises.readFile(file, 'utf8'))
@@ -67,8 +77,19 @@ export class SourceDependencies {
       }
       entry.dependencies = []
       for (const name of entry.includes) {
-        for (const candidate of includeCandidates(file, name, incdirs)) {
-          if ((await stat(candidate))?.isFile()) {
+        let candidates = includeCandidates(file, name, incdirs)
+        if (!path.isAbsolute(name)) {
+          const local = candidates.shift()!
+          if (!policy.disableLocalIncludes) {
+            if (policy.incDirFirst) {
+              candidates.push(local)
+            } else {
+              candidates.unshift(local)
+            }
+          }
+        }
+        for (const candidate of candidates) {
+          if (buffers.has(candidate) || (await stat(candidate))?.isFile()) {
             entry.dependencies.push(candidate)
             if (!seen.has(candidate)) {
               seen.add(candidate)
