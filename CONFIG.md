@@ -93,6 +93,11 @@
     Group missing includes/macros/packages into an information message and hide dependent undeclared-name errors. Turn off for strict diagnostics, including missing modules. Real name mistakes may also be hidden in files with incomplete dependencies.
 
 
+- `verilog.lint.slang.ignoredDiagnostics`: array = []
+
+    Diagnostic codes to hide from Problems in both the built-in server and CLI fallback, such as ExpectedMember, ExpectedDeclarator, NotAllowedInCU, ExpectedExpression, ExpectedIdentifier or unknown-sys-name. Exact, case-sensitive matches. Raw Diagnostics retains the original results; parsing and the compiler error limit are unchanged.
+
+
 - `verilog.lint.slang.threads`: integer = 1
 
     Threads per slang process. One reduces peak resource use. Checks run one process at a time; additional arguments can override this with -j.

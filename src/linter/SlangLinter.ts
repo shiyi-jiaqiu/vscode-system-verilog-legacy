@@ -351,6 +351,12 @@ export default class SlangLinter extends ToolConfig {
     description:
       'Group missing includes/macros/packages into an information message and hide dependent undeclared-name errors. Turn off for strict diagnostics, including missing modules. Real name mistakes may also be hidden in files with incomplete dependencies.',
   })
+  ignoredDiagnostics = new ConfigObject<string[]>({
+    default: [],
+    items: { type: 'string' },
+    description:
+      'Diagnostic codes to hide from Problems in both the built-in server and CLI fallback, such as ExpectedMember, ExpectedDeclarator, NotAllowedInCU, ExpectedExpression, ExpectedIdentifier or unknown-sys-name. Exact, case-sensitive matches. Raw Diagnostics retains the original results; parsing and the compiler error limit are unchanged.',
+  })
   threads = new ConfigObject<number>({
     default: 1,
     minimum: 1,
@@ -384,6 +390,14 @@ export default class SlangLinter extends ToolConfig {
 
   rawDiagnostics(uri: vscode.Uri): unknown {
     return this.raw.get(uri.fsPath) ?? this.raw.get('') ?? { status: 'No CLI result received yet' }
+  }
+
+  filterDiagnostics(diagnostics: vscode.Diagnostic[]): vscode.Diagnostic[] {
+    const ignored = new Set(this.ignoredDiagnostics.getValue())
+    return diagnostics.filter((diagnostic) => {
+      const code = typeof diagnostic.code === 'object' ? diagnostic.code.value : diagnostic.code
+      return !ignored.has(String(code))
+    })
   }
   /// The empty key is the project; other keys are individually checked file paths.
   private runs = new Map<
@@ -768,7 +782,7 @@ export default class SlangLinter extends ToolConfig {
       if (project) {
         this.diagnostics.clear()
         for (const [file, diags] of files) {
-          this.diagnostics.set(vscode.Uri.file(file), diags)
+          this.diagnostics.set(vscode.Uri.file(file), this.filterDiagnostics(diags))
         }
         this.logger.info(`${entries.length} diagnostics in ${files.size} files`)
       } else if (doc !== undefined) {
@@ -794,7 +808,7 @@ export default class SlangLinter extends ToolConfig {
             }
           }
         }
-        this.diagnostics.set(doc.uri, diagnostics)
+        this.diagnostics.set(doc.uri, this.filterDiagnostics(diagnostics))
       }
     } catch (error) {
       if (current()) {

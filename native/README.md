@@ -1,11 +1,13 @@
-# Native server for extension 0.6.2
+# Native server for extensions 0.6.2 and 0.6.3
 
 `slang-server-legacy.patch` applies to upstream
 [60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c),
 with its direct submodules initialized. The resulting server identifies itself as
 `0.3.1+60857ce-legacy0.6.2`. Keep upstream MIT notices.
 
-This revision changes both the client and native service. Rebuild and upgrade both.
+Extension 0.6.3 adds client-side diagnostic filtering and reuses the 0.6.2 native
+server unchanged. Upgrading from 0.6.2 only requires the new VSIX. Earlier versions
+should upgrade both the client and native service.
 The client waits for `slang/includeConfiguration` after initialization, then uses
 those effective directories and include-search policies for include resolution.
 Older binaries without that notification fall back after the startup timeout.

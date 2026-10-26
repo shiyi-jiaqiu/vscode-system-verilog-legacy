@@ -2,7 +2,7 @@
   "name": "verilog-systemverilog-legacy",
   "displayName": "Verilog/SystemVerilog Legacy",
   "description": "Ctags-based Verilog/SystemVerilog indexing, hovers with parameter and macro values, semantic highlighting and project linting, for VS Code 1.84",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "publisher": "local",
   "keywords": [
     "verilog",
@@ -401,6 +401,14 @@
           "default": true,
           "description": "Group missing includes/macros/packages into an information message and hide dependent undeclared-name errors. Turn off for strict diagnostics, including missing modules. Real name mistakes may also be hidden in files with incomplete dependencies.",
           "type": "boolean"
+        },
+        "verilog.lint.slang.ignoredDiagnostics": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Diagnostic codes to hide from Problems in both the built-in server and CLI fallback, such as ExpectedMember, ExpectedDeclarator, NotAllowedInCU, ExpectedExpression, ExpectedIdentifier or unknown-sys-name. Exact, case-sensitive matches. Raw Diagnostics retains the original results; parsing and the compiler error limit are unchanged.",
+          "type": "array"
         },
         "verilog.lint.slang.threads": {
           "default": 1,

@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.6.3] - 2026-10-26
+
+- Add `verilog.lint.slang.ignoredDiagnostics` to hide selected diagnostic codes in both the built-in server and CLI fallback while retaining raw results.
+
 ## [0.6.2] - 2026-10-26
 
 - Remove Perl/template highlighting, masking, static-only routing, and lint/formatting exclusions from the client and native patch. All HDL files now follow the ordinary tool paths; rebuild both components.

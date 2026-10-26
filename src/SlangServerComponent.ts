@@ -775,7 +775,7 @@ export class SlangServerComponent extends ExtensionComponent {
         diagnostics.push(summary)
       }
     }
-    this.client.diagnostics?.set(uri, diagnostics)
+    this.client.diagnostics?.set(uri, lint.filterDiagnostics(diagnostics))
   }
 
   private updateStatus() {

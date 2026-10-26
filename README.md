@@ -15,14 +15,14 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.6.2.vsix
+code --install-extension verilog-systemverilog-legacy-0.6.3.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.
 
 ## Language engine
 
-`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The VSIX embeds the client, so the upstream VS Code extension is not required. This version requires the matching `0.3.1+60857ce-legacy0.6.2` server, based on upstream commit `60857ce` with the [included patch](native/README.md). Upgrade both the VSIX and the server binary. The client waits for the server’s effective include configuration before routing documents; startup can be cancelled; `verilog.server.startupTimeout` bounds the protocol handshake (15 seconds by default). Metadata indexing runs after the handshake. The 0.6.2 Linux x86_64 offline kit includes the matching server built with GCC 11.4 against a glibc 2.17 sysroot. Earlier server binaries retain the template exclusions.
+`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The VSIX embeds the client, so the upstream VS Code extension is not required. This version uses the `0.3.1+60857ce-legacy0.6.2` server, based on upstream commit `60857ce` with the [included patch](native/README.md). When upgrading from 0.6.2, update the VSIX; its native server remains compatible. Older versions should update both components. The client waits for the server’s effective include configuration before routing documents; startup can be cancelled; `verilog.server.startupTimeout` bounds the protocol handshake (15 seconds by default). Metadata indexing runs after the handshake. The 0.6.3 Linux x86_64 offline kit includes the matching server built with GCC 11.4 against a glibc 2.17 sysroot. Servers older than `legacy0.6.2` retain the template exclusions.
 
 The native engine provides semantic hovers, definitions, completion, references, rename, workspace symbols using shallow analysis. Incoming call hierarchy requires a selected elaborated design; default shallow mode can return no hierarchy, and outgoing call hierarchy is unsupported. It indexes source metadata across the workspace and analyzes open files with referenced design units. It does not run make or a simulator as part of this extension's setup. Existing native server configurations remain in effect.
 
@@ -39,6 +39,21 @@ Warning, reading-mode, thread-count and filelist updates reload the server confi
 Files are passed to the selected HDL tools without special handling for embedded scripts or unexpanded `<perl>` / `<pl>` markup. Generate valid Verilog/SystemVerilog before analysis or formatting.
 
 The language status shows the active engine or a startup failure. The integrated server currently supports a single-folder workspace.
+
+To hide selected diagnostic types, add their exact codes to User or Workspace settings:
+
+```json
+"verilog.lint.slang.ignoredDiagnostics": [
+  "ExpectedMember",
+  "ExpectedDeclarator",
+  "NotAllowedInCU",
+  "ExpectedExpression",
+  "ExpectedIdentifier",
+  "unknown-sys-name"
+]
+```
+
+The default list is empty. This filters Problems from both the built-in server and CLI fallback; **Show Raw Diagnostics** keeps the original results. Parsing and the compiler error limit are unchanged. Built-in server results update when the setting changes; with manual CLI lint, run **Verilog: Lint** again after changing it.
 
 The CLI must support `--diag-column-unit=byte` and `--all-deps` (tested with slang 12). The extension translates diagnostic endpoints and notes from original saved bytes using `files.encoding`, loading only files mentioned in diagnostics. Its compiler dependency list also covers libraries and macro includes. Unavailable source/encoding retains the reported file and line with an explicit unknown-column note. Save affected sources and headers before CLI lint. Editing an input cancels affected checks and clears affected results, including an open Raw view; unrelated files keep their saved diagnostics. In project scope, editing any compiler input clears the project result because library changes can affect diagnostics in other files. Native manual lint uses the current editor buffer.
 
