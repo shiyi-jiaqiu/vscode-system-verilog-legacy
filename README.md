@@ -15,14 +15,14 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.6.3.vsix
+code --install-extension verilog-systemverilog-legacy-0.6.4.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.
 
 ## Language engine
 
-`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The VSIX embeds the client, so the upstream VS Code extension is not required. This version uses the `0.3.1+60857ce-legacy0.6.2` server, based on upstream commit `60857ce` with the [included patch](native/README.md). When upgrading from 0.6.2, update the VSIX; its native server remains compatible. Older versions should update both components. The client waits for the server’s effective include configuration before routing documents; startup can be cancelled; `verilog.server.startupTimeout` bounds the protocol handshake (15 seconds by default). Metadata indexing runs after the handshake. The 0.6.3 Linux x86_64 offline kit includes the matching server built with GCC 11.4 against a glibc 2.17 sysroot. Servers older than `legacy0.6.2` retain the template exclusions.
+`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The VSIX embeds the client, so the upstream VS Code extension is not required. This version uses the `0.3.1+60857ce-legacy0.6.4` server, based on upstream commit `60857ce` with the [included patch](native/README.md). Upgrade both the VSIX and native service to receive the UVM and SystemVerilog indexing/navigation repairs. The client waits for the server’s effective include configuration before routing documents; startup can be cancelled; `verilog.server.startupTimeout` bounds the protocol handshake (15 seconds by default). Metadata indexing runs after the handshake. The 0.6.4 Linux x86_64 offline kit includes the matching server built with GCC 11.4 against a glibc 2.17 sysroot. Servers older than `legacy0.6.2` retain the template exclusions.
 
 The native engine provides semantic hovers, definitions, completion, references, rename, workspace symbols using shallow analysis. Incoming call hierarchy requires a selected elaborated design; default shallow mode can return no hierarchy, and outgoing call hierarchy is unsupported. It indexes source metadata across the workspace and analyzes open files with referenced design units. It does not run make or a simulator as part of this extension's setup. Existing native server configurations remain in effect.
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.4] - 2026-10-26
+
+- Include class declarations in native workspace symbol search, preserving compiler scope rules for navigation and completion.
+- Repair native navigation, hover and completion through virtual interface handles, and navigation to virtual interface types inside parameterized UVM calls. Requires rebuilding the native service; extension 0.6.3 remains compatible.
+- Index typedefs, enums, nettypes, functions/tasks, modports, clocking blocks, properties, sequences, let declarations and covergroups for workspace search. Preserve lexical visibility during semantic navigation and completion.
+- Resolve struct and class members after function calls, parentheses, casts, conditional expressions and queue method calls; discover macro-generated types during cold indexing and refresh them on header changes.
+
 ## [0.6.3] - 2026-10-26
 
 - Add `verilog.lint.slang.ignoredDiagnostics` to hide selected diagnostic codes in both the built-in server and CLI fallback while retaining raw results.

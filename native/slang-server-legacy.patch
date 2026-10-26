@@ -15,7 +15,7 @@ index d8ccf70..d32b079 100644
      rfl::Description<"Include directories, relative to the workspace root. Searched after "
                       "directories supplied through flags and build files. Supports $VAR, "
 diff --git a/include/Indexer.h b/include/Indexer.h
-index 88bd7a2..eb75275 100644
+index 88bd7a2..3160721 100644
 --- a/include/Indexer.h
 +++ b/include/Indexer.h
 @@ -22,6 +22,7 @@
@@ -46,7 +46,16 @@ index 88bd7a2..eb75275 100644
      };
      /// Find the nearest indexed declaration by directory distance, breaking ties by canonical path.
      std::optional<GlobalSymbolLoc> getNearestSymbolLoc(std::string_view name,
-@@ -162,6 +169,7 @@ private:
+@@ -152,7 +159,7 @@ struct Indexer {
+ 
+     // Iterate over all symbols (for workspace symbols)
+     template<std::invocable<const std::string&, const Indexer::GlobalSymbolLoc&> Callback>
+-    void forEachSymbol(Callback&& callback) const;
++    void forEachSymbol(bool includeDeclarations, Callback&& callback) const;
+ 
+ private:
+     friend struct IndexWriteGuard;
+@@ -162,17 +169,22 @@ private:
      struct GlobalSymbol {
          std::string name;
          slang::syntax::SyntaxKind kind;
@@ -54,7 +63,13 @@ index 88bd7a2..eb75275 100644
      };
  
      struct IndexedPath {
-@@ -173,6 +181,8 @@ private:
+         const std::filesystem::path* path = nullptr;
+         slang::SmallVector<GlobalSymbol> symbols;
++        /// Scoped declarations for workspace search; visibility is resolved by the compiler.
++        slang::SmallVector<GlobalSymbol> declarations;
+         slang::SmallVector<std::string> macros;
+         slang::SmallVector<std::string> referencedSymbols;
+         /// Declarations available by including this header in the enclosing scope.
          slang::SmallVector<std::string> headerSymbols;
          /// Quoted include spellings encountered without expanding other files.
          slang::SmallVector<std::string> includes;
@@ -63,7 +78,7 @@ index 88bd7a2..eb75275 100644
      };
  
      // Index storage
-@@ -190,6 +200,8 @@ private:
+@@ -190,6 +202,8 @@ private:
      /// Files containing each include filename, gathered without resolving include paths.
      std::unordered_map<std::string, slang::SmallVector<const std::filesystem::path*, 2>>
          includeReferences_;
@@ -72,7 +87,7 @@ index 88bd7a2..eb75275 100644
  
      /// Reverse relationships from parsed buffers, keyed by canonical paths.
      std::unordered_map<std::filesystem::path, std::vector<std::filesystem::path>> includers_;
-@@ -265,6 +277,18 @@ private:
+@@ -265,6 +279,18 @@ private:
  
      // Threading - uses reader-writer lock pattern
      uint32_t numThreads_ = 0;
@@ -91,6 +106,26 @@ index 88bd7a2..eb75275 100644
      mutable std::shared_mutex indexMutex_;
      mutable std::condition_variable_any indexingCondition_;
      bool indexingInProgress_ = false;
+@@ -309,11 +335,18 @@ struct IndexReadGuard {
+ 
+ // Implementation of forEachSymbol template (needs IndexReadGuard definition)
+ template<std::invocable<const std::string&, const Indexer::GlobalSymbolLoc&> Callback>
+-void Indexer::forEachSymbol(Callback&& callback) const {
++void Indexer::forEachSymbol(bool includeDeclarations, Callback&& callback) const {
+     IndexReadGuard guard(*this);
+     for (const auto& [name, entries] : symbolToFiles_) {
+         for (const auto& entry : entries) {
+             callback(name, entry);
+         }
+     }
++    if (includeDeclarations) {
++        for (const auto& [path, file] : indexedFiles) {
++            for (const auto& item : file.declarations)
++                callback(item.name,
++                         GlobalSymbolLoc{.uri = path, .kind = item.kind, .range = item.range});
++        }
++    }
+ }
 diff --git a/include/ServerDiagClient.h b/include/ServerDiagClient.h
 index 251b930..aa1cc6f 100644
 --- a/include/ServerDiagClient.h
@@ -335,7 +370,7 @@ index 0000000..636c038
 +}
 +} // namespace server
 diff --git a/src/Indexer.cpp b/src/Indexer.cpp
-index 88c35cd..c18b849 100644
+index 88c35cd..1f18cf6 100644
 --- a/src/Indexer.cpp
 +++ b/src/Indexer.cpp
 @@ -11,6 +11,11 @@
@@ -350,7 +385,23 @@ index 88c35cd..c18b849 100644
  #include <BS_thread_pool.hpp>
  #include <cctype>
  #include <filesystem>
-@@ -160,7 +165,9 @@ void Indexer::extractFromRoot(const slang::syntax::CompilationUnitSyntax& root,
+@@ -23,6 +28,7 @@
+ #include <unordered_map>
+ 
+ #include "slang/driver/SourceLoader.h"
++#include "slang/diagnostics/PreprocessorDiags.h"
+ #include "slang/parsing/Parser.h"
+ #include "slang/parsing/ParserMetadata.h"
+ #include "slang/parsing/Preprocessor.h"
+@@ -30,6 +36,7 @@
+ #include "slang/syntax/SyntaxKind.h"
+ #include "slang/syntax/SyntaxNode.h"
+ #include "slang/syntax/SyntaxTree.h"
++#include "slang/syntax/SyntaxVisitor.h"
+ #include "slang/text/SourceLocation.h"
+ #include "slang/text/SourceManager.h"
+ #include "slang/util/Bag.h"
+@@ -160,11 +167,88 @@ void Indexer::extractFromRoot(const slang::syntax::CompilationUnitSyntax& root,
                  continue;
              std::string_view name = decl.header->name.valueText();
              if (!name.empty()) {
@@ -361,7 +412,86 @@ index 88c35cd..c18b849 100644
              }
          }
      }
-@@ -236,46 +243,125 @@ std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path
+ 
++    auto addDeclaration = [&](slang::parsing::Token token, SyntaxKind kind) {
++        if (primaryBuffer != slang::BufferID::getPlaceholder() &&
++            sourceManager.getFullyExpandedLoc(token.location()).buffer() != primaryBuffer)
++            return;
++        if (!token.valueText().empty()) {
++            dest.declarations.push_back(
++                GlobalSymbol{.name = std::string(token.valueText()),
++                             .kind = kind,
++                             .range = server::toRange(token.range(), sourceManager)});
++        }
++    };
++    auto declarations = makeSyntaxVisitor([&](auto& visitor, const SyntaxNode& node) {
++        auto kind = node.kind;
++        if (ProceduralBlockSyntax::isKind(kind))
++            return;
++        switch (kind) {
++            case SyntaxKind::ClassDeclaration:
++                addDeclaration(node.as<ClassDeclarationSyntax>().name, kind);
++                break;
++            case SyntaxKind::TypedefDeclaration: {
++                const auto& decl = node.as<TypedefDeclarationSyntax>();
++                addDeclaration(decl.name, decl.type->kind == SyntaxKind::EnumType
++                                              ? SyntaxKind::EnumType
++                                              : kind);
++                break;
++            }
++            case SyntaxKind::EnumType:
++                for (auto* item : node.as<EnumTypeSyntax>().members)
++                    addDeclaration(item->name, SyntaxKind::Declarator);
++                return;
++            case SyntaxKind::ForwardTypedefDeclaration:
++                addDeclaration(node.as<ForwardTypedefDeclarationSyntax>().name, kind);
++                return;
++            case SyntaxKind::NetTypeDeclaration:
++                addDeclaration(node.as<NetTypeDeclarationSyntax>().name, kind);
++                return;
++            case SyntaxKind::FunctionDeclaration:
++            case SyntaxKind::TaskDeclaration:
++                addDeclaration(node.as<FunctionDeclarationSyntax>().prototype->name->getLastToken(),
++                               kind);
++                return;
++            case SyntaxKind::ClassMethodPrototype:
++                addDeclaration(
++                    node.as<ClassMethodPrototypeSyntax>().prototype->name->getLastToken(),
++                    SyntaxKind::FunctionDeclaration);
++                return;
++            case SyntaxKind::ModportItem:
++                addDeclaration(node.as<ModportItemSyntax>().name, kind);
++                return;
++            case SyntaxKind::ClockingDeclaration:
++                addDeclaration(node.as<ClockingDeclarationSyntax>().blockName, kind);
++                return;
++            case SyntaxKind::PropertyDeclaration:
++                addDeclaration(node.as<PropertyDeclarationSyntax>().name, kind);
++                return;
++            case SyntaxKind::SequenceDeclaration:
++                addDeclaration(node.as<SequenceDeclarationSyntax>().name, kind);
++                return;
++            case SyntaxKind::LetDeclaration:
++                addDeclaration(node.as<LetDeclarationSyntax>().identifier, kind);
++                return;
++            case SyntaxKind::CovergroupDeclaration:
++                addDeclaration(node.as<CovergroupDeclarationSyntax>().name, kind);
++                return;
++            case SyntaxKind::DataDeclaration:
++            case SyntaxKind::NetDeclaration:
++            case SyntaxKind::ContinuousAssign:
++                return;
++            default:
++                break;
++        }
++        visitor.visitDefault(node);
++    });
++    root.visit(declarations);
++
+     // Extract referenced symbols from metadata
+     slang::SmallSet<std::string_view, 8> seenDeps;
+     meta.visitReferencedSymbols([&](std::string_view name) {
+@@ -236,46 +320,132 @@ std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path
      std::vector<IndexedPath> loadResults;
      loadResults.resize(paths.size());
  
@@ -378,11 +508,13 @@ index 88c35cd..c18b849 100644
 +    auto processRange = [this, &loadResults, &paths](size_t start, size_t end) {
 +        struct Header {
 +            bool opaqueInclude = false;
++            bool hasTypedef = false;
 +            std::vector<std::pair<std::string, bool>> includes;
 +        };
 +        std::unordered_map<fs::path, Header> headers;
 +        auto scanHeader = [](std::string_view text) {
 +            Header result;
++            result.hasTypedef = text.find("typedef") != std::string_view::npos;
 +            // Includes in inactive branches are retained as potential topology edges.
 +            // Literal paths need no compiler work; macro paths use the full pass below.
 +            size_t at = 0;
@@ -470,12 +602,14 @@ index 88c35cd..c18b849 100644
 -            if (!meta.nodeMeta.empty()) {
 -                extractFromRoot(root, meta, sourceManager, buffer.id, dest);
 +            bool opaqueInclude = false;
++            bool hasTypedef = false;
 +            std::unordered_set<fs::path> visited, candidates;
 +            std::vector<std::pair<fs::path, Header>> pending{{paths[i], std::move(primary)}};
 +            for (size_t j = 0; j < pending.size(); ++j) {
 +                auto [parent, header] = pending[j];
 +                if (!visited.insert(server::includeIdentity(parent)).second) continue;
 +                opaqueInclude |= header.opaqueInclude;
++                hasTypedef |= header.hasTypedef;
 +                for (const auto& [name, system] : header.includes) {
 +                    auto search = server::includeCandidates(parent, name, system, includes_, systemIncludes_,
 +                                                           pp.additionalIncludePaths, disableLocal_, incDirFirst_);
@@ -501,7 +635,10 @@ index 88c35cd..c18b849 100644
 +            const auto text = buffer->data;
 +            static const std::regex dynamicDeclaration(
 +                R"(\b(module|interface|package|program|class|checker)\s+`)");
-+            const bool expand = opaqueInclude || (!tree->getIncludeDirectives().empty() &&
++            const bool unknownMacro = std::ranges::any_of(tree->diagnostics(), [](const auto& diag) {
++                return diag.code == slang::diag::UnknownDirective;
++            });
++            const bool expand = opaqueInclude || (hasTypedef && unknownMacro) || (!tree->getIncludeDirectives().empty() &&
 +                (text.find("`ifdef") != std::string_view::npos ||
 +                 text.find("`ifndef") != std::string_view::npos ||
 +                 text.find("`elsif") != std::string_view::npos ||
@@ -522,7 +659,7 @@ index 88c35cd..c18b849 100644
          }
      };
  
-@@ -291,6 +377,50 @@ std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path
+@@ -291,6 +461,50 @@ std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path
      return loadResults;
  }
  
@@ -573,7 +710,7 @@ index 88c35cd..c18b849 100644
  Indexer::Indexer() = default;
  
  const fs::path* Indexer::internUri(const fs::path& path) {
-@@ -301,8 +431,21 @@ const fs::path* Indexer::internUri(const fs::path& path) {
+@@ -301,8 +515,21 @@ const fs::path* Indexer::internUri(const fs::path& path) {
  void Indexer::updateDocument(const fs::path& path, const slang::syntax::SyntaxTree& tree) {
      IndexWriteGuard guard(*this);
  
@@ -595,7 +732,7 @@ index 88c35cd..c18b849 100644
      extractFromRoot(tree.root().as<slang::syntax::CompilationUnitSyntax>(), tree.getMetadata(),
                      tree.sourceManager(), tree.getSourceBufferIds()[0], newPath);
  
-@@ -369,7 +512,8 @@ void Indexer::indexPath(const fs::path& path, IndexedPath& indexedFile) {
+@@ -369,7 +596,8 @@ void Indexer::indexPath(const fs::path& path, IndexedPath& indexedFile) {
      indexedFile.path = uriPtr;
  
      for (const auto& item : indexedFile.symbols)
@@ -605,7 +742,7 @@ index 88c35cd..c18b849 100644
  
      for (const auto& name : indexedFile.macros)
          macroToFiles_[name].push_back(uriPtr);
-@@ -386,6 +530,11 @@ void Indexer::indexPath(const fs::path& path, IndexedPath& indexedFile) {
+@@ -386,6 +614,11 @@ void Indexer::indexPath(const fs::path& path, IndexedPath& indexedFile) {
          if (includeNames.insert(name).second)
              includeReferences_[name].push_back(uriPtr);
      }
@@ -617,7 +754,7 @@ index 88c35cd..c18b849 100644
  
      // Store the indexed path for efficient removal later
      indexedFiles[uriPtr] = std::move(indexedFile);
-@@ -417,6 +566,16 @@ void Indexer::removePathFromIndex(const fs::path* pathPtr) {
+@@ -417,6 +650,16 @@ void Indexer::removePathFromIndex(const fs::path* pathPtr) {
  
      const IndexedPath& entry = it->second;
  
@@ -634,7 +771,7 @@ index 88c35cd..c18b849 100644
      for (const auto& spelling : entry.includes) {
          auto references = includeReferences_.find(fs::path(spelling).filename().string());
          if (references == includeReferences_.end())
-@@ -999,6 +1158,33 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
+@@ -999,6 +1242,33 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
  
      for (const auto& change : params.changes) {
          fs::path path = change.uri.getPath();
@@ -668,7 +805,7 @@ index 88c35cd..c18b849 100644
  
          switch (change.type) {
              case lsp::FileChangeType::Created: {
-@@ -1025,6 +1211,9 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
+@@ -1025,6 +1295,9 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
  
      // Parse all new/changed files potentially in thread pool
      if (!pathsToAdd.empty()) {
@@ -678,7 +815,7 @@ index 88c35cd..c18b849 100644
          auto indexedPaths = indexPaths(pathsToAdd);
          for (size_t i = 0; i < indexedPaths.size(); ++i)
              indexPath(pathsToAdd[i], indexedPaths[i]);
-@@ -1046,9 +1235,7 @@ void Indexer::collectFilesFromDirectory(const fs::path& dir,
+@@ -1046,9 +1319,7 @@ void Indexer::collectFilesFromDirectory(const fs::path& dir,
          return paths.contains(normalized);
      };
  
@@ -689,7 +826,7 @@ index 88c35cd..c18b849 100644
          (!paths.empty() && paths.containsDirectoryOrAncestor(
                                 (fs::absolute(dir).lexically_normal() / "").generic_string())) ||
          !fs::exists(dir) || !fs::is_directory(dir)) {
-@@ -1130,10 +1317,15 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
+@@ -1130,10 +1401,15 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
                              const std::map<std::string, std::string>& env) {
      std::vector<fs::path> pathsToIndex;
      DirectoryEntryCounts directoryEntries;
@@ -706,7 +843,7 @@ index 88c35cd..c18b849 100644
      for (const auto& cfg : indexConfigs) {
          std::vector<std::string> excludedNames;
          std::vector<std::string> excludedPaths;
-@@ -1174,6 +1366,7 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
+@@ -1174,6 +1450,7 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
              else {
                  continue;
              }
@@ -714,7 +851,7 @@ index 88c35cd..c18b849 100644
              collectFilesFromDirectory(fullDirPath.lexically_normal(), excludedNames, pathsToIndex,
                                        counts, excludedPaths);
          }
-@@ -1187,6 +1380,15 @@ void Indexer::startIndexing(const std::vector<std::string>& globs,
+@@ -1187,6 +1464,15 @@ void Indexer::startIndexing(const std::vector<std::string>& globs,
                              bool inferIncludeDirectories,
                              const std::map<std::string, std::string>& env) {
      std::vector<fs::path> pathsToIndex;
@@ -730,7 +867,7 @@ index 88c35cd..c18b849 100644
      for (const auto& pattern : globs) {
          ScopedTimer t_glob("Globbing " + pattern);
          size_t beginCount = pathsToIndex.size();
-@@ -1277,7 +1479,13 @@ void Indexer::indexAndReport(std::vector<fs::path> pathsToIndex, bool inferInclu
+@@ -1277,7 +1563,13 @@ void Indexer::indexAndReport(std::vector<fs::path> pathsToIndex, bool inferInclu
      IndexWriteGuard guard(*this);
      ScopedTimer t_index("Workspace indexing");
      directoryEntryCounts_ = std::move(directoryEntries);
@@ -1122,7 +1259,7 @@ index 5cd6d93..4956abd 100644
  }
  
 diff --git a/src/SlangServer.cpp b/src/SlangServer.cpp
-index 9635833..615b5dd 100644
+index 9635833..dd1c132 100644
 --- a/src/SlangServer.cpp
 +++ b/src/SlangServer.cpp
 @@ -255,9 +255,7 @@ lsp::InitializeResult SlangServer::getInitialize(const lsp::InitializeParams& pa
@@ -1353,7 +1490,12 @@ index 9635833..615b5dd 100644
          return;
      }
      m_fileWatchers.dispatch(params);
-@@ -1430,7 +1478,7 @@ SlangServer::getWorkspaceSymbol(const lsp::WorkspaceSymbolParams& params) {
+@@ -1426,11 +1474,11 @@ SlangServer::getWorkspaceSymbol(const lsp::WorkspaceSymbolParams& params) {
+ 
+     std::vector<lsp::WorkspaceSymbol> result;
+ 
+-    m_indexer.forEachSymbol([&](const std::string& name, const Indexer::GlobalSymbolLoc& entry) {
++    m_indexer.forEachSymbol(true, [&](const std::string& name, const Indexer::GlobalSymbolLoc& entry) {
          if (!params.query.empty() && !fuzzyMatch(params.query, name))
              return;
          result.emplace_back(
@@ -1373,6 +1515,19 @@ index 9635833..615b5dd 100644
  
      INFO("Completion: kind={} trigger='{}' query={}", toString(ctx.lspContext.triggerKind),
           ctx.lspContext.triggerCharacter.value_or(""), toString(ctx.query->kind()));
+diff --git a/src/completions/InstanceCompletions.cpp b/src/completions/InstanceCompletions.cpp
+index 053e7b7..89b89ec 100644
+--- a/src/completions/InstanceCompletions.cpp
++++ b/src/completions/InstanceCompletions.cpp
+@@ -146,7 +146,7 @@ void InstanceCompletionQuery::addCompletions(std::vector<lsp::CompletionItem>& r
+                                              const CompletionContext& context) {
+     std::unordered_set<std::string_view> seenNames;
+ 
+-    indexer.forEachSymbol([&](const std::string& name, const Indexer::GlobalSymbolLoc& entry) {
++    indexer.forEachSymbol(false, [&](const std::string& name, const Indexer::GlobalSymbolLoc& entry) {
+         if (!seenNames.insert(name).second)
+             return;
+ 
 diff --git a/src/document/DefinitionInfo.cpp b/src/document/DefinitionInfo.cpp
 index 24cb0f4..4a5f7b4 100644
 --- a/src/document/DefinitionInfo.cpp
@@ -1389,6 +1544,80 @@ index 24cb0f4..4a5f7b4 100644
      const auto linkLabel = label.empty()
                                 ? fmt::format("{}:{}:{}", path.filename().string(), line, column)
                                 : fmt::format("`{}`", label);
+diff --git a/src/document/ShallowAnalysis.cpp b/src/document/ShallowAnalysis.cpp
+index f266096..9dba927 100644
+--- a/src/document/ShallowAnalysis.cpp
++++ b/src/document/ShallowAnalysis.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include "slang/ast/ASTContext.h"
+ #include "slang/ast/Compilation.h"
++#include "slang/ast/Expression.h"
+ #include "slang/ast/symbols/BlockSymbols.h"
+ #include "slang/ast/symbols/CompilationUnitSymbols.h"
+ #include "slang/ast/symbols/InstanceSymbols.h"
+@@ -277,12 +278,12 @@ const ast::Scope* ShallowAnalysis::getScopeFromSym(const ast::Symbol* symbol) co
+         if (type.isScope()) {
+             return &type.as<ast::Scope>();
+         }
++        if (auto* iface = type.as_if<ast::VirtualInterfaceType>())
++            return iface->modport ? static_cast<const ast::Scope*>(iface->modport)
++                                  : &iface->iface.body;
+     }
+     else if (ast::ValueSymbol::isKind(symbol->kind)) {
+-        auto& type = unwrapErrorType(symbol->as<ast::ValueSymbol>().getType());
+-        if (type.isScope()) {
+-            return &type.as<ast::Scope>();
+-        }
++        return getScopeFromSym(&symbol->as<ast::ValueSymbol>().getType());
+     }
+     else if (ast::InstanceSymbol::isKind(symbol->kind)) {
+         return &symbol->as<ast::InstanceSymbol>().body.as<ast::Scope>();
+@@ -633,6 +634,23 @@ slang::SmallVector<const ast::Symbol*, 2> ShallowAnalysis::getSymbolsAtToken(
+     if (!syntax) {
+         return symbols;
+     }
++    if (declTok->kind == parsing::TokenKind::CloseParenthesis ||
++        declTok->kind == parsing::TokenKind::CloseBracket) {
++        const syntax::ExpressionSyntax* expression = nullptr;
++        for (auto* node = syntax; node && node->getLastToken() == *declTok; node = node->parent) {
++            if (auto* candidate = node->as_if<syntax::ExpressionSyntax>())
++                expression = candidate;
++        }
++        if (expression && !syntax::NameSyntax::isKind(expression->kind)) {
++            for (auto* scope : m_symbolIndexer.getScopesForSyntax(*expression)) {
++                ast::ASTContext context(*scope, ast::LookupLocation::max);
++                const auto& bound = ast::Expression::bind(*expression, context);
++                if (!bound.bad())
++                    addSymbol(bound.type);
++            }
++            return symbols;
++        }
++    }
+     if (syntax->kind == syntax::SyntaxKind::SuperHandle) {
+         // Slang only accepts 'super' as part of a qualified lookup, while completion
+         // queries need the receiver alone, including when the member is unfinished.
+@@ -763,6 +781,20 @@ slang::SmallVector<const ast::Symbol*, 2> ShallowAnalysis::getSymbolsAtToken(
+     }
+ 
+     auto resolveInScope = [&](const ast::Scope* scope) -> const ast::Symbol* {
++        auto* virtualType = syntax->as_if<syntax::VirtualInterfaceTypeSyntax>();
++        if (!virtualType && syntax->kind == syntax::SyntaxKind::DotMemberClause)
++            virtualType = syntax->parent->as_if<syntax::VirtualInterfaceTypeSyntax>();
++        if (virtualType) {
++            ast::ASTContext context(*scope, ast::LookupLocation::max);
++            const auto& type = ast::VirtualInterfaceType::fromSyntax(context, *virtualType);
++            auto* iface = type.as_if<ast::VirtualInterfaceType>();
++            if (!iface)
++                return nullptr;
++            if (virtualType->name == *declTok)
++                return &iface->iface.getDefinition();
++            return iface->modport;
++        }
++
+         // Perform name lookup; this should be most gotos.
+         auto nameSyntax = findNameSyntax(*syntax);
+         if (!nameSyntax) {
 diff --git a/src/document/SlangDoc.cpp b/src/document/SlangDoc.cpp
 index 0df7a1a..695b9f4 100644
 --- a/src/document/SlangDoc.cpp
@@ -1436,7 +1665,7 @@ index 0df7a1a..695b9f4 100644
          auto startOffset = colToOffset(start.line, start.character);
          auto endOffset = colToOffset(end.line, end.character);
 diff --git a/src/util/Converters.cpp b/src/util/Converters.cpp
-index 4a56e91..427686c 100644
+index 4a56e91..cbc064a 100644
 --- a/src/util/Converters.cpp
 +++ b/src/util/Converters.cpp
 @@ -45,15 +45,28 @@ std::optional<const parsing::Token> findNameToken(const syntax::SyntaxNode* node
@@ -1483,8 +1712,32 @@ index 4a56e91..427686c 100644
  }
  
  lsp::Location toLocation(const SourceRange& range, const SourceManager& sourceManager) {
+@@ -126,7 +136,23 @@ lsp::SymbolKind toSymbolKind(const syntax::SyntaxKind& kind) {
+         case syntax::SyntaxKind::PackageDeclaration:
+             return lsp::SymbolKind::Package;
+         case syntax::SyntaxKind::ClassDeclaration:
++        case syntax::SyntaxKind::CovergroupDeclaration:
+             return lsp::SymbolKind::Class;
++        case syntax::SyntaxKind::TypedefDeclaration:
++        case syntax::SyntaxKind::ForwardTypedefDeclaration:
++        case syntax::SyntaxKind::NetTypeDeclaration:
++            return lsp::SymbolKind::Struct;
++        case syntax::SyntaxKind::EnumType:
++            return lsp::SymbolKind::Enum;
++        case syntax::SyntaxKind::Declarator:
++            return lsp::SymbolKind::EnumMember;
++        case syntax::SyntaxKind::ModportItem:
++            return lsp::SymbolKind::Interface;
++        case syntax::SyntaxKind::ClockingDeclaration:
++            return lsp::SymbolKind::Object;
++        case syntax::SyntaxKind::PropertyDeclaration:
++        case syntax::SyntaxKind::SequenceDeclaration:
++        case syntax::SyntaxKind::LetDeclaration:
+         case syntax::SyntaxKind::FunctionDeclaration:
+         case syntax::SyntaxKind::TaskDeclaration:
+             return lsp::SymbolKind::Function;
 diff --git a/src/util/VersionInfo.cpp.in b/src/util/VersionInfo.cpp.in
-index 4a28cae..90792c2 100644
+index 4a28cae..3e39178 100644
 --- a/src/util/VersionInfo.cpp.in
 +++ b/src/util/VersionInfo.cpp.in
 @@ -25,7 +25,7 @@ int VersionInfo::getPatch() {
@@ -1492,7 +1745,7 @@ index 4a28cae..90792c2 100644
  
  string_view VersionInfo::getHash() {
 -    return "@SLANG_SERVER_VERSION_HASH@"sv;
-+    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.2"sv;
++    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.4"sv;
  }
  
  }
@@ -1562,6 +1815,106 @@ index 3e84537..c157d39 100644
 +        .text = "renamed"}});
 +    CHECK(doc.doc->getText() == std::string("module renamed; // 🙂 appended\nendmodule\n") + '\0');
 +}
+diff --git a/tests/cpp/GotoTests.cpp b/tests/cpp/GotoTests.cpp
+index dace555..ff71b5b 100644
+--- a/tests/cpp/GotoTests.cpp
++++ b/tests/cpp/GotoTests.cpp
+@@ -6,6 +6,95 @@
+ 
+ using namespace slang;
+ 
++TEST_CASE("Struct members after expression receivers support navigation and completion",
++          "[sv-features]") {
++    auto receiver = GENERATE("make_packet()", "factory.read()", "box.get_item()", "(packet)",
++                             "packet_t'(packet)", "(flag ? packet : packet)",
++                             "pending.pop_front()");
++    ServerHarness server;
++    auto doc = server.openFile("expression_members.sv", R"(
++package packets;
++    typedef struct packed { logic [7:0] payload; } packet_t;
++    function automatic packet_t make_packet(); return '0; endfunction
++    class maker;
++        function packet_t read(); return '0; endfunction
++    endclass
++    class wrapper #(type T = packet_t);
++        function T get_item(); return '0; endfunction
++    endclass
++endpackage
++module top;
++    import packets::*;
++    packet_t packet;
++    packet_t pending[$];
++    maker factory;
++    wrapper #(packet_t) box;
++    bit flag;
++    initial $display(make_packet().payload, factory.read().payload, box.get_item().payload,
++                     (packet).payload, packet_t'(packet).payload, (flag ? packet : packet).payload,
++                     pending.pop_front().payload);
++endmodule
++)");
++    auto cursor = doc.before(std::string(receiver) + ".payload").after(std::string(receiver) + ".");
++    auto definitions = cursor.getDefinitions();
++    REQUIRE(definitions.size() == 1);
++    CHECK(definitions.front().targetUri == doc.m_uri);
++    CHECK(definitions.front().targetSelectionRange.start ==
++          doc.after("logic [7:0] ").getPosition());
++    REQUIRE(doc.getHoverAt(cursor.m_offset));
++    auto completions = cursor.getCompletions();
++    CHECK(std::ranges::any_of(completions,
++                              [](const auto& item) { return item.m_item.label == "payload"; }));
++}
++
++TEST_CASE("UVM virtual interface handles and type arguments navigate to their declarations",
++          "[uvm]") {
++    ServerHarness server;
++    auto doc = server.openFile("uvm_virtual_interface.sv", R"(
++interface bus_if;
++    logic data;
++    task send_op(); endtask
++    modport driver(output data, import send_op);
++endinterface
++class config_db #(type T = int);
++    static function void set(T value); endfunction
++endclass
++class agent;
++    virtual bus_if vif;
++    virtual bus_if.driver restricted_vif;
++    task run();
++        vif.send_op();
++        vif.data = 1;
++        restricted_vif.send_op();
++        restricted_vif.data = 1;
++    endtask
++endclass
++module top;
++    bus_if b();
++    initial config_db #(virtual bus_if)::set(b);
++endmodule
++)");
++    for (auto [reference, prefix, declaration] :
++         {std::tuple{"vif.send_op()", "vif.", "task "}, std::tuple{"vif.data =", "vif.", "logic "},
++          std::tuple{"restricted_vif.send_op()", "restricted_vif.", "task "},
++          std::tuple{"config_db #(virtual bus_if)", "config_db #(virtual ", "interface "}}) {
++        CAPTURE(reference);
++        auto cursor = doc.before(reference).after(prefix);
++        auto definitions = cursor.getDefinitions();
++        CHECK(definitions.size() == 1);
++        if (definitions.size() == 1) {
++            CHECK(definitions.front().targetUri == doc.m_uri);
++            CHECK(definitions.front().targetSelectionRange.start ==
++                  doc.after(declaration).getPosition());
++        }
++        auto hover = doc.getHoverAt(cursor.m_offset);
++        REQUIRE(hover);
++    }
++    auto completions = doc.after("vif.").getCompletions();
++    CHECK(std::ranges::any_of(completions,
++                              [](const auto& item) { return item.m_item.label == "send_op"; }));
++}
++
+ TEST_CASE("Class methods resolve before their declarations in nested statements", "[scan-gaps]") {
+     ServerHarness server;
+     auto doc = server.openFile("forward_methods.sv", R"(
 diff --git a/tests/cpp/IndexerTests.cpp b/tests/cpp/IndexerTests.cpp
 index 2dfc961..6775f8a 100644
 --- a/tests/cpp/IndexerTests.cpp
@@ -1612,6 +1965,84 @@ index 324e905..1904ef2 100644
  
      for (const auto& ref : *refs) {
          CHECK(ref.uri.str().find("other_pkg.sv") == std::string::npos);
+diff --git a/tests/cpp/WorkspaceSymbolTests.cpp b/tests/cpp/WorkspaceSymbolTests.cpp
+index ff86360..0bb1788 100644
+--- a/tests/cpp/WorkspaceSymbolTests.cpp
++++ b/tests/cpp/WorkspaceSymbolTests.cpp
+@@ -17,6 +17,73 @@ static std::set<std::string> getSymbolNames(ServerHarness& server, const std::st
+     return names;
+ }
+ 
++TEST_CASE("Workspace symbols include UVM classes without making them global design units",
++          "[uvm]") {
++    ServerHarness server;
++    auto doc = server.openFile("uvm_classes.sv", R"(
++package agents;
++    class transaction; endclass
++    class driver #(type T = transaction);
++        class nested; endclass
++    endclass
++endpackage
++class standalone; endclass
++)");
++    doc.save();
++    auto result = server.getWorkspaceSymbol(lsp::WorkspaceSymbolParams{.query = ""});
++    const auto& symbols = rfl::get<std::vector<lsp::WorkspaceSymbol>>(result);
++    for (auto name : {"transaction", "driver", "nested", "standalone"}) {
++        CAPTURE(name);
++        auto found = std::ranges::find(symbols, name, &lsp::WorkspaceSymbol::name);
++        REQUIRE(found != symbols.end());
++        CHECK(found->kind == lsp::SymbolKind::Class);
++        const auto& location = rfl::get<lsp::Location>(found->location);
++        CHECK(location.uri == doc.m_uri);
++        CHECK(location.range.start == doc.before(name).getPosition());
++        CHECK_FALSE(server.m_indexer.getNearestSymbolLoc(name, doc.m_uri.getPath()));
++    }
++}
++
++TEST_CASE("Workspace symbols include SV types and scoped declarations", "[sv-features]") {
++    ServerHarness server;
++    auto doc = server.openFile("sv_declarations.sv", R"(
++package types;
++    typedef struct packed { int value; } packet_t;
++    typedef union packed { int bits; byte [3:0] bytes; } word_t;
++    typedef enum {IDLE, BUSY} state_t;
++    typedef logic [7:0] byte_t;
++    nettype logic wire_value_t;
++    function int read_count(); return 0; endfunction
++    task send_packet(); endtask
++endpackage
++interface bus(input logic clk);
++    logic data;
++    modport master(output data);
++    clocking cb @(posedge clk); input data; endclocking
++endinterface
++module top(input logic clk);
++    sequence ready_seq; @(posedge clk) 1; endsequence
++    property ready_prop; @(posedge clk) ready_seq; endproperty
++    let is_ready(x) = x != 0;
++    covergroup statistics @(posedge clk); cp: coverpoint clk; endgroup
++endmodule
++)");
++    doc.save();
++    auto result = server.getWorkspaceSymbol(lsp::WorkspaceSymbolParams{.query = ""});
++    const auto& symbols = rfl::get<std::vector<lsp::WorkspaceSymbol>>(result);
++    for (auto name :
++         {"packet_t", "word_t", "state_t", "byte_t", "wire_value_t", "read_count", "send_packet",
++          "master", "cb", "ready_seq", "ready_prop", "is_ready", "statistics"}) {
++        CAPTURE(name);
++        auto found = std::ranges::find(symbols, name, &lsp::WorkspaceSymbol::name);
++        REQUIRE(found != symbols.end());
++        const auto& location = rfl::get<lsp::Location>(found->location);
++        CHECK(location.uri == doc.m_uri);
++        CHECK(location.range.start == doc.before(name).getPosition());
++        CHECK_FALSE(server.m_indexer.getNearestSymbolLoc(name, doc.m_uri.getPath()));
++    }
++}
++
+ TEST_CASE("Workspace symbol - empty query returns all") {
+     ServerHarness server;
+ 
 diff --git a/tests/cpp/golden/CheckUninstantiated.json b/tests/cpp/golden/CheckUninstantiated.json
 index cf910bc..2eadacc 100644
 --- a/tests/cpp/golden/CheckUninstantiated.json

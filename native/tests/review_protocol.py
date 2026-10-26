@@ -150,6 +150,27 @@ class ReviewTests(unittest.TestCase):
     def names(self):
         return {entry['name'] for entry in self.server.request('workspace/symbol', {'query': ''})}
 
+    def test_SV_macro_typedefs_are_indexed_cold_and_refresh_from_headers(self):
+        self.config()
+        self.write('types.svh', '`define DECL_T(n) typedef struct packed { int payload; } n;\n')
+        self.write('wrapper.svh', '`include "types.svh"\n`define WRAP_T(n) `DECL_T(n)\n')
+        self.write('packets.sv', '`include "wrapper.svh"\npackage packets;\n`WRAP_T(packet_t)\nendpackage\n')
+        self.write('user.sv', 'module user; import packets::*; packet_t data; initial data.payload=1; endmodule\n')
+        s = self.start()
+        matches = s.request('workspace/symbol', {'query': 'packet_t'})
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]['location']['uri'], s.uri('packets.sv'))
+        self.assertEqual(matches[0]['location']['range']['start']['line'], 2)
+        self.assertNotEqual(matches[0]['kind'], 0)
+        s.open('user.sv')
+        column = (self.root/'user.sv').read_text().index('payload')
+        definitions = s.request('textDocument/definition', s.at('user.sv', 0, column))
+        self.assertTrue(definitions)
+        self.write('types.svh', '`define DECL_T(n) typedef struct packed { int changed; } n; typedef int added_t;\n')
+        s.watched(('types.svh', 2))
+        self.assertIn('added_t', self.names())
+        self.assertEqual(s.request('textDocument/definition', s.at('user.sv', 0, column)), [])
+
     def test_F01_unsaved_reference_and_rename(self):
         self.config()
         self.write('child.sv', 'module child; endmodule\n')

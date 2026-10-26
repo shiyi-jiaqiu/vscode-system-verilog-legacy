@@ -4,6 +4,76 @@ The review HTML covers extension commit `4be60e23e3b31cacc3851637ebdfc8e3b0a3156
 These tests recreate its minimal cases; the original evidence ZIP was not part of
 this repair workspace. They do not replace target ABI or long-session acceptance.
 
+## UVM projects
+
+`uvm_projects.py` exercises the unmodified TinyALU sequence testbench from
+[UVM Primer](https://github.com/raysalemi/uvmprimer/tree/4958c6f2a8099302d6a55660661556a5e95b3a9f/23_UVM_Sequences)
+and the [Accellera UBus example](https://github.com/accellera/uvm/tree/69c55a3326379576b4946f79e133d64d69142daa/distrib/examples/integrated/ubus),
+using the [current reference library](https://github.com/accellera-official/uvm-core/tree/78c06547a2a0a29b3dc9dcafae62b75b2ff61544).
+The test uses temporary copies, selects the supplied SystemVerilog DUT for TinyALU,
+and disables optional UVM DPI calls. It needs no simulator or modified vendor sources.
+
+```sh
+git clone https://github.com/raysalemi/uvmprimer.git /tmp/uvmprimer
+git -C /tmp/uvmprimer checkout 4958c6f2a8099302d6a55660661556a5e95b3a9f
+git clone https://github.com/accellera/uvm.git /tmp/uvm-reference
+git -C /tmp/uvm-reference checkout 69c55a3326379576b4946f79e133d64d69142daa
+git clone https://github.com/accellera-official/uvm-core.git /tmp/uvm-core
+git -C /tmp/uvm-core checkout 78c06547a2a0a29b3dc9dcafae62b75b2ff61544
+python3 native/tests/uvm_projects.py /absolute/path/to/slang-server \
+  /tmp/uvmprimer /tmp/uvm-reference /tmp/uvm-core --slang /absolute/path/to/slang
+```
+
+Checks cover cold class indexing with declaration ranges, cross-file definitions
+and hover, inheritance, factory creation, virtual interfaces and member calls.
+Native lint must report an injected undeclared identifier and clear it after repair.
+The CLI must accept both projects in parse and local-lint modes, and TinyALU in
+full-elaboration mode. UBus full elaboration must report exactly two errors for its
+obsolete `uvm_test_done` API, which the current library removed; those errors are
+checked explicitly and remain visible. Compiler warnings remain visible. The original UVM library bundled with the
+older `accellera/uvm` checkout has compatibility errors with slang 12; these checks
+use the pinned `uvm-core` library instead. They validate editor/compiler behavior,
+not simulation results. Set `VERILOG_TEST_EVIDENCE` to retain fixtures and protocol traffic.
+
+## Common SystemVerilog declarations and member access
+
+The feature categories follow the [slang language support list](https://sv-lang.com/language-support.html).
+The results below describe the patched native editor service. Compiler language
+support alone does not establish editor navigation support.
+
+| Construct | Workspace search | Navigation checks |
+| --- | --- | --- |
+| module, interface, package | Existing | Instantiation, parameters and cross-file imports |
+| modport and clocking block | Added | Interface ports, aliases, clocking signals and virtual handles |
+| typedef struct/union, enum, aliases and nettypes | Added | Type references, nested fields and enum values |
+| packed/unpacked arrays, dynamic arrays, queues, associative arrays | Named typedefs added | Element field selection; queue-method return values |
+| class and interface class | Class search added in the preceding UVM repair | Inheritance, implementation, parameters, extern methods and factory calls |
+| function/task | Added | Calls and return-value members |
+| property, sequence and let | Added | SVA and let references |
+| covergroup | Added | Named covergroup type references |
+| macro-generated typedefs | Added | Cold discovery, declaration locations and header refresh |
+
+The `[sv-features]` C++ cases protect declaration search and member navigation,
+hover and completion after calls, casts, parentheses, conditional expressions and
+queue-method calls. The public-protocol macro case also checks a transitive macro
+header before opening any source, then edits that header and requeries the index.
+Workspace search collects named declarations in design scopes; local variables
+and anonymous types are not separately added to that global search. Compiler
+built-in methods such as `covergroup.sample()` have no source declaration for F12.
+
+`axi_project.py` additionally checks the unmodified
+[PULP AXI repository](https://github.com/pulp-platform/axi/tree/70b8e54fd460e3308e58be596ceb3566a6e3576e).
+Its small consumer uses the actual `AXI_TYPEDEF_ALL` macros, `AXI_BUS` interface,
+and AXI package. It checks cold type search, nested field definitions, hover,
+completion and full CLI elaboration without requiring a simulator.
+
+```sh
+git clone https://github.com/pulp-platform/axi.git /tmp/axi
+git -C /tmp/axi checkout 70b8e54fd460e3308e58be596ceb3566a6e3576e
+python3 native/tests/axi_project.py /absolute/path/to/slang-server /tmp/axi \
+  --slang /absolute/path/to/slang
+```
+
 ## Run
 
 Build the matching native binary using [../README.md](../README.md), then from the
