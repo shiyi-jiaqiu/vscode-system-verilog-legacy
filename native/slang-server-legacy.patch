@@ -1555,7 +1555,7 @@ index 4a56e91..427686c 100644
  
  lsp::Location toLocation(const SourceRange& range, const SourceManager& sourceManager) {
 diff --git a/src/util/VersionInfo.cpp.in b/src/util/VersionInfo.cpp.in
-index 4a28cae..587c804 100644
+index 4a28cae..6c7c0cf 100644
 --- a/src/util/VersionInfo.cpp.in
 +++ b/src/util/VersionInfo.cpp.in
 @@ -25,7 +25,7 @@ int VersionInfo::getPatch() {
@@ -1563,7 +1563,7 @@ index 4a28cae..587c804 100644
  
  string_view VersionInfo::getHash() {
 -    return "@SLANG_SERVER_VERSION_HASH@"sv;
-+    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.0-review2"sv;
++    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.1"sv;
  }
  
  }

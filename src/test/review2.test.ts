@@ -180,6 +180,50 @@ suite('Follow-up review regressions', function () {
     await bad.save()
   })
 
+  test('N3: editing a project library invalidates diagnostics in its consumers', async () => {
+    const cell = await open('dirty-library/libcell.v', 'module libcell(input [3:0] p); endmodule\n')
+    const top = await open(
+      'dirty-library-top.sv',
+      "module library_top; libcell c(.p(8'hff)); endmodule\n"
+    )
+    const list = path.join(dir, 'dirty-library.f')
+    await fs.promises.writeFile(
+      list,
+      `${top.fileName}\n-y ${path.dirname(cell.fileName)}\n+libext+.v\n`
+    )
+    try {
+      await setting('lint.slang.runOnSave', false)
+      await setting('lint.slang.scope', 'project')
+      await setting('lint.slang.analysis', 'full')
+      await setting('filelist', list)
+      await ext.lint.slang.lint(top)
+      assert.ok(
+        vscode.languages
+          .getDiagnostics(top.uri)
+          .some((diag) => diag.message.includes('logic[3:0]'))
+      )
+      const edit = new vscode.WorkspaceEdit()
+      edit.replace(
+        cell.uri,
+        new vscode.Range(0, 0, cell.lineCount, 0),
+        'module libcell(input [7:0] p); endmodule\n'
+      )
+      assert.ok(await vscode.workspace.applyEdit(edit))
+      await pause(100)
+      assert.deepStrictEqual(vscode.languages.getDiagnostics(top.uri), [])
+      assert.ok(!JSON.stringify(ext.lint.slang.rawDiagnostics(top.uri)).includes('logic[3:0]'))
+      await cell.save()
+      await ext.lint.slang.lint(top)
+      assert.deepStrictEqual(vscode.languages.getDiagnostics(top.uri), [])
+    } finally {
+      await cell.save()
+      await setting('filelist', '')
+      await setting('lint.slang.scope', 'openFiles')
+      await setting('lint.slang.analysis', 'local')
+      await setting('lint.slang.runOnSave', true)
+    }
+  })
+
   test('N6/N7: compiler-discovered includes keep their file and byte-derived range', async () => {
     const header = await open('extra/only-args.svh', '// header\nlocalparam int VALUE=missing;\n')
     const doc = await open(

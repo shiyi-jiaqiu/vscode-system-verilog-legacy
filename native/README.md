@@ -1,9 +1,9 @@
-# Native server for the 0.6.0 review fixes
+# Native server for extension 0.6.1
 
 `slang-server-legacy.patch` applies to upstream
 [60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c),
 with its direct submodules initialized. The resulting server identifies itself as
-`0.3.1+60857ce-legacy0.6.0-review2`. Keep upstream MIT notices.
+`0.3.1+60857ce-legacy0.6.1`. Keep upstream MIT notices.
 
 This revision changes both the client and native service. Rebuild and upgrade both.
 The client waits for `slang/includeConfiguration` after initialization, then uses
@@ -45,13 +45,18 @@ from upstream; existing caches can be supplied through the usual
 
 ## Target ABI
 
-The modern Linux build used to validate these fixes is a development artifact,
-not a CentOS 7 release binary. Static C++ runtimes alone do not establish glibc
-2.17 compatibility. The previous offline kit predates these fixes and cannot be
-used to validate this source revision.
+The 0.6.1 Linux x86_64 binary is built with GCC 11.4 and a glibc 2.17
+sysroot derived from CentOS 7.9 packages. Add these options to the build above:
 
-A CentOS 7 release still needs a glibc 2.17 toolchain/sysroot build, SHA256 and build
-records, ELF symbol/dependency checks on that exact binary, and its protocol and
-VS Code 1.84.2 tests in the target environment. Keep container/userspace results
-separate from a complete CentOS 7 VM. Include the actual offline package's third
-party license notices. No new target-ABI acceptance is claimed by this patch.
+```sh
+-DCMAKE_CXX_COMPILER=/path/to/glibc217-toolchain/bin/x86_64-conda-linux-gnu-g++
+-DPython_EXECUTABLE=/usr/bin/python3
+```
+
+The release binary requires at most `GLIBC_2.17`. Its dynamic dependencies are
+libc, libm, libpthread and the ELF loader; the C++ runtime is linked statically.
+Release verification runs the matching binary with CentOS 7.9 glibc libraries
+under proot and the official VS Code 1.84.2 host. This exercises the userspace ABI
+on the host kernel; it does not establish compatibility with a complete CentOS 7
+kernel/VM or validate Windows/macOS and long-running sessions. Release notes record
+the test results. The offline archive includes the patch and third-party notices.

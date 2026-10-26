@@ -16,14 +16,14 @@ Values are computed lexically from defaults; parameter overrides at instantiatio
 ## Install
 
 ```sh
-code --install-extension verilog-systemverilog-legacy-0.6.0.vsix
+code --install-extension verilog-systemverilog-legacy-0.6.1.vsix
 ```
 
 Requirements on the machine running the extension host: [Universal Ctags](https://github.com/universal-ctags/ctags), [slang](https://github.com/MikePopoloski/slang) for linting and [verible-verilog-format](https://github.com/chipsalliance/verible) for formatting.
 
 ## Language engine
 
-`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The VSIX embeds the client, so the upstream VS Code extension is not required. These review fixes require the matching `0.3.1+60857ce-legacy0.6.0-review2` server, based on upstream commit `60857ce` with the [included patch](native/README.md). Upgrade both the VSIX and the server binary. The client waits for the server’s effective include configuration before routing documents; startup can be cancelled; `verilog.server.startupTimeout` bounds the protocol handshake (15 seconds by default). Metadata indexing runs after the handshake. A new glibc 2.17 binary and target-environment acceptance are required before distributing this revision for CentOS 7; the earlier offline kit does not contain these native fixes.
+`verilog.server.enabled` defaults to on. Set `verilog.server.path` to a compatible `slang-server` executable; an empty path searches PATH and the configured slang executable's directory. The VSIX embeds the client, so the upstream VS Code extension is not required. These review fixes require the matching `0.3.1+60857ce-legacy0.6.1` server, based on upstream commit `60857ce` with the [included patch](native/README.md). Upgrade both the VSIX and the server binary. The client waits for the server’s effective include configuration before routing documents; startup can be cancelled; `verilog.server.startupTimeout` bounds the protocol handshake (15 seconds by default). Metadata indexing runs after the handshake. The 0.6.1 Linux x86_64 offline kit includes the matching server built with GCC 11.4 against a glibc 2.17 sysroot. Earlier kits do not contain these native fixes.
 
 The native engine provides semantic hovers, definitions, completion, references, rename, workspace symbols using shallow analysis. Incoming call hierarchy requires a selected elaborated design; default shallow mode can return no hierarchy, and outgoing call hierarchy is unsupported. It indexes source metadata across the workspace and analyzes open files with referenced design units. It does not run make or a simulator as part of this extension's setup. Existing native server configurations remain in effect.
 
@@ -39,7 +39,7 @@ Warning, reading-mode, thread-count and filelist updates reload the server confi
 
 The language status shows the active engine or a startup failure. The integrated server currently supports a single-folder workspace.
 
-The CLI must support `--diag-column-unit=byte` and `--all-deps` (tested with slang 12). The extension translates diagnostic endpoints and notes from original saved bytes using `files.encoding`, loading only files mentioned in diagnostics. Its compiler dependency list also covers libraries and macro includes. Unavailable source/encoding retains the reported file and line with an explicit unknown-column note. Save affected sources and headers before CLI lint. Editing an input cancels affected checks and clears affected results, including an open Raw view; unrelated files keep their saved diagnostics. Native manual lint uses the current editor buffer.
+The CLI must support `--diag-column-unit=byte` and `--all-deps` (tested with slang 12). The extension translates diagnostic endpoints and notes from original saved bytes using `files.encoding`, loading only files mentioned in diagnostics. Its compiler dependency list also covers libraries and macro includes. Unavailable source/encoding retains the reported file and line with an explicit unknown-column note. Save affected sources and headers before CLI lint. Editing an input cancels affected checks and clears affected results, including an open Raw view; unrelated files keep their saved diagnostics. In project scope, editing any compiler input clears the project result because library changes can affect diagnostics in other files. Native manual lint uses the current editor buffer.
 
 ## Configure the CLI fallback
 

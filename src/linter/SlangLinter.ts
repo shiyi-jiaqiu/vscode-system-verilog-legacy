@@ -423,6 +423,10 @@ export default class SlangLinter extends ToolConfig {
         this.runs.delete(key)
       }
     }
+    if (this.checkedInputs.get('')?.has(file)) {
+      this.diagnostics.clear()
+      this.raw.delete('')
+    }
     for (const [key, inputs] of this.checkedInputs) {
       if (key && inputs.has(file)) {
         affected.add(key)
