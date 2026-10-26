@@ -79,7 +79,10 @@ export class VerilogDoc {
   private logger: Logger
   private parsing: Promise<void> | undefined
   private parsedVersion = -1
-  private importsComplete = true
+  private importing: Promise<{ symbols: Symbol[]; scopes: Map<Symbol, Set<string>> }> | undefined
+  private importsRevision = -1
+  private importsGeneration = 0
+  private importedScopes = new Map<Symbol, Set<string>>()
 
   constructor(logger: Logger, document: vscode.TextDocument) {
     this.symbols = []
@@ -92,6 +95,21 @@ export class VerilogDoc {
 
   clearSymbols() {
     this.isDirty = true
+    this.invalidateImports()
+  }
+
+  invalidateImports() {
+    this.importSymbols = undefined
+    this.importing = undefined
+    this.importsGeneration++
+  }
+
+  /// Enum literals are declared in the surrounding scope, although ctags attaches
+  /// them to their typedef for outline grouping.
+  memberScope(sym: Symbol): string {
+    return sym.type === 'constant' && sym.parentType === 'typedef'
+      ? sym.parentScope.split('.').slice(0, -1).join('.')
+      : sym.parentScope
   }
 
   async getSymbols(filter: SymbolFilter = {}, addImports = true): Promise<Symbol[]> {
@@ -107,7 +125,7 @@ export class VerilogDoc {
           }
           await this.buildSymbolsList(output)
           this.parsedVersion = version
-          this.importSymbols = undefined
+          this.invalidateImports()
         })().finally(() => {
           this.parsing = undefined
         })
@@ -115,46 +133,70 @@ export class VerilogDoc {
       await this.parsing
     }
     if (addImports) {
+      const revision = ext.index.revision
+      if (this.importsRevision !== revision) {
+        this.invalidateImports()
+        this.importsRevision = revision
+      }
       if (this.importSymbols === undefined) {
-        const imports = await this.parseImports()
-        // Native metadata can still be indexing on the first outline / hover request.
-        // Retry unresolved imports on demand instead of caching a permanent miss.
-        this.importSymbols = this.importsComplete ? imports : undefined
-        return filterSymbols(this.symbols.concat(imports), filter)
+        const generation = this.importsGeneration
+        const pending = (this.importing ??= this.parseImports())
+        const imported = await pending
+        if (
+          generation !== this.importsGeneration ||
+          revision !== ext.index.revision ||
+          this.parsedVersion !== this.doc.version
+        ) {
+          return this.getSymbols(filter, addImports)
+        }
+        // Publish both halves atomically. Cache misses until input/index invalidation,
+        // and let concurrent requests await the same resolution work.
+        this.importSymbols = imported.symbols
+        this.importedScopes = imported.scopes
       }
       return filterSymbols(this.symbols.concat(this.importSymbols), filter)
     }
     return filterSymbols(this.symbols, filter)
   }
 
-  async parseImports(): Promise<Symbol[]> {
-    this.importsComplete = true
-    // search for import pkg::*;
-    let importedFiles: vscode.Uri[] = []
-    const importRe = /[^\w]import ([^:]+)::\*;/g
-    const text = maskTemplate(this.doc.getText()).text
-    let match
-    while ((match = importRe.exec(text)) !== null) {
+  private async parseImports(): Promise<{ symbols: Symbol[]; scopes: Map<Symbol, Set<string>> }> {
+    const scopes = new Map<Symbol, Set<string>>()
+    const add = (sym: Symbol, scope: string) => {
+      const visible = scopes.get(sym) ?? new Set<string>()
+      visible.add(scope)
+      scopes.set(sym, visible)
+    }
+    const text = maskTemplate(this.doc.getText()).text.replace(
+      /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g,
+      (part) => part.replace(/[^\r\n]/g, ' ')
+    )
+    const importRe = /\bimport\s+([A-Za-z_]\w*)\s*::\s*(\*|[A-Za-z_]\w*)\s*;/g
+    for (const match of text.matchAll(importRe)) {
       const doc = await ext.index.findFile(match[1])
-      if (doc !== undefined) {
-        importedFiles.push(doc.uri)
-      } else {
-        this.importsComplete = false
+      if (!doc) {
+        continue
+      }
+      const scope = this.scopeAt(this.doc.positionAt(match.index!)) ?? ''
+      const imported = ext.index.getVerilogDoc(doc)
+      const members = await imported.getSymbols({}, false)
+      for (const sym of members) {
+        if (imported.memberScope(sym) === match[1] && (match[2] === '*' || sym.name === match[2])) {
+          add(sym, scope)
+        }
       }
     }
-
-    if (ext.server.active) {
-      importedFiles.push(...(await ext.index.dependencyDocuments(this.doc)).map((doc) => doc.uri))
+    for (const doc of await ext.index.dependencyDocuments(this.doc)) {
+      const dependency = ext.index.getVerilogDoc(doc)
+      if (dependency === this) {
+        continue
+      }
+      for (const sym of await dependency.getSymbols({}, false)) {
+        if (dependency.memberScope(sym) === '') {
+          add(sym, '')
+        }
+      }
     }
-
-    // parse each import in parallel
-    const symbols: Promise<Symbol[]>[] = importedFiles.map(async (uri) => {
-      let doc = await vscode.workspace.openTextDocument(uri)
-      const ctags = ext.index.getVerilogDoc(doc)
-      return ctags.getSymbols({}, false)
-    })
-
-    return (await Promise.all(symbols)).reduce((acc, curr) => acc.concat(curr), [])
+    return { symbols: [...scopes.keys()], scopes }
   }
 
   async getModules(): Promise<Symbol[]> {
@@ -184,7 +226,7 @@ export class VerilogDoc {
       os.tmpdir(),
       `vscode-verilog-${process.pid}-${++ctagsInputCount}${path.extname(this.doc.fileName)}`
     )
-    await fs.promises.writeFile(input, maskMacroCalls(maskTemplate(text).text))
+    await fs.promises.writeFile(input, maskMacroCalls(maskTemplate(text, true).text))
     let args: string[] =
       '-f - --fields=+K --sort=no --excmd=n --fields-SystemVerilog=+{parameter}'.split(' ')
     args.push(...CTAGS_MAPS)
@@ -270,35 +312,70 @@ export class VerilogDoc {
         }
 
         {
-          // end tags are not supported yet in ctags. So, using regex
-          let match: RegExpExecArray | null = null
-          let endPosition: vscode.Position
-          let text = this.doc.getText()
-          const starts = this.symbols.slice().sort((a, b) => a.line - b.line)
-          const open = new Map<string, Symbol[]>()
-          let next = 0
-          let eRegex: RegExp = /^(?![\r\n])\s*end(\w*)*[\s:]?/gm
-          while ((match = eRegex.exec(text))) {
-            if (match === null) {
-              break
-            }
-            if (typeof match[1] === 'undefined') {
-              continue
-            }
-
-            endPosition = this.doc.positionAt(match.index + match[0].length - 1)
-            // symbols that start before this end tag are waiting for theirs, by type
-            while (next < starts.length && starts[next].startPosition.isBefore(endPosition)) {
-              const sym = starts[next++]
-              const waiting = open.get(sym.type)
-              if (waiting === undefined) {
-                open.set(sym.type, [sym])
-              } else {
-                waiting.push(sym)
+          // Pair lexical delimiters, including unnamed begin/end frames, so a nested
+          // declaration cannot leak into its siblings. Mask comments and strings first.
+          const text = maskTemplate(this.doc.getText()).text.replace(
+            /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g,
+            (part) => part.replace(/[^\r\n]/g, ' ')
+          )
+          const frames: { kind: string; symbol?: Symbol; start: number }[] = []
+          const byKind = new Map<string, Symbol[]>()
+          for (const symbol of this.symbols) {
+            const list = byKind.get(symbol.type) ?? []
+            list.push(symbol)
+            byKind.set(symbol.type, list)
+          }
+          const cursors = new Map<string, number>()
+          const delimiters =
+            /\b(module|interface|package|program|class|function|task|checker|clocking|generate|begin|end(?:module|interface|package|program|class|function|task|checker|clocking|generate)?)\b/g
+          for (const match of text.matchAll(delimiters)) {
+            const token = match[0]
+            if (!token.startsWith('end')) {
+              const kind = token === 'begin' ? 'block' : token
+              let symbol: Symbol | undefined
+              // Unnamed blocks have no tag. Named declarations consume an ordered
+              // per-kind cursor, so each tag is examined at most once, including
+              // names on later lines of a function/task header.
+              if (
+                kind !== 'block' ||
+                /^\s*:\s*\w+/.test(
+                  text.slice(match.index! + token.length, match.index! + token.length + 256)
+                )
+              ) {
+                const line = this.doc.positionAt(match.index!).line
+                const end = text.indexOf(';', match.index!)
+                const lastLine =
+                  kind === 'block' ? line : this.doc.positionAt(end < 0 ? text.length : end).line
+                const candidates = byKind.get(kind) ?? []
+                let cursor = cursors.get(kind) ?? 0
+                while (cursor < candidates.length && candidates[cursor].line < line) {
+                  cursor++
+                }
+                if (cursor < candidates.length && candidates[cursor].line <= lastLine) {
+                  symbol = candidates[cursor++]
+                }
+                cursors.set(kind, cursor)
               }
+              frames.push({ kind, symbol, start: match.index! })
+            } else {
+              const kind = token === 'end' ? 'block' : token.slice(3)
+              let index = frames.length - 1
+              while (index >= 0 && frames[index].kind !== kind) {
+                index--
+              }
+              if (index < 0) {
+                continue
+              }
+              const frame = frames[index]
+              if (frame.symbol) {
+                frame.symbol.fullRange = new vscode.Range(
+                  this.doc.positionAt(frame.start),
+                  this.doc.positionAt(match.index! + token.length)
+                )
+                frame.symbol.isValid = true
+              }
+              frames.length = index
             }
-            // the nearest unclosed symbol of the same type; doesn't check for begin...end blocks
-            open.get(match[1])?.pop()?.setEndPosition(endPosition.line)
           }
         }
 
@@ -354,7 +431,7 @@ export class VerilogDoc {
     let words = new Set(sym.getHoverText().match(/\b[a-zA-Z_]\w*\b/g) || [])
     words.delete(sym.name)
 
-    const unit = sym.parentScope.split('.')[0]
+    const unit = sym.parentScope
     let syms: Symbol[] = []
     for (const word of words) {
       syms.push(...(await this.findVisible(word, unit)))
@@ -372,37 +449,56 @@ export class VerilogDoc {
     return ret
   }
 
-  /// Symbols named `name` as seen from top level unit `unit` (a module, interface or package
-  /// of this file): those in the unit first, then the rest of the file, then imported packages.
+  /// Search the nearest lexical scope, enclosing scopes, then explicit imports.
+  /// Sibling packages, functions and blocks are never visible by proximity alone.
   async findVisible(name: string, unit: string | undefined): Promise<Symbol[]> {
-    const all = await this.getSymbols({ name })
-    const own = all.filter((sym) => sym.doc === this.doc)
-    const inUnit = own.filter(
-      (sym) =>
-        unit !== undefined &&
-        (sym.parentScope === unit || sym.parentScope.startsWith(unit + '.') || sym.name === unit)
-    )
-    if (inUnit.length > 0) {
-      return inUnit
-    }
-    if (own.length > 0) {
-      return own
-    }
-    // imports of imports can bring a package in twice
-    const seen = new Set<string>()
-    return all.filter((sym) => {
-      const key = sym.doc.uri.toString() + ':' + sym.line
-      if (seen.has(key)) {
-        return false
+    return this.visibleSymbols(unit, name)
+  }
+
+  async visibleSymbols(unit: string | undefined, name?: string): Promise<Symbol[]> {
+    const all = await this.getSymbols(name === undefined ? {} : { name })
+    const own = this.symbols.filter((sym) => name === undefined || sym.name === name)
+    const found = new Map<string, Symbol[]>()
+    let scope = unit ?? ''
+    for (;;) {
+      const local = new Map<string, Symbol[]>()
+      for (const sym of own.filter((sym) => this.memberScope(sym) === scope)) {
+        local.set(sym.name, [...(local.get(sym.name) ?? []), sym])
       }
-      seen.add(key)
-      return true
-    })
+      const imported = new Map<string, Set<Symbol>>()
+      for (const sym of all.filter((sym) => this.importedScopes.get(sym)?.has(scope))) {
+        if (!local.has(sym.name)) {
+          const candidates = imported.get(sym.name) ?? new Set<Symbol>()
+          candidates.add(sym)
+          imported.set(sym.name, candidates)
+        }
+      }
+      for (const [key, candidates] of [...local, ...imported]) {
+        if (!found.has(key)) {
+          found.set(key, [...candidates])
+        }
+      }
+      if (scope === '') {
+        break
+      }
+      scope = scope.includes('.') ? scope.slice(0, scope.lastIndexOf('.')) : ''
+    }
+    return [...found.values()].flat()
   }
 
   /// name of the top level unit of this file containing `position`
   unitAt(position: vscode.Position): string | undefined {
     return this.topSymbols.find((sym) => sym.isValid && sym.getFullRange().contains(position))?.name
+  }
+
+  scopeAt(position: vscode.Position): string | undefined {
+    return this.symbols
+      .filter((sym) => sym.isValid && sym.getFullRange().contains(position))
+      .sort(
+        (a, b) =>
+          b.parentScope.split('.').length - a.parentScope.split('.').length || b.line - a.line
+      )
+      .map((sym) => (sym.parentScope ? `${sym.parentScope}.${sym.name}` : sym.name))[0]
   }
 
   /// For an instance connected with `.*`, a hint after it listing the ports of its module

@@ -1,0 +1,4 @@
+[
+  "\n```systemverilog\nlocalparam int SIZE=DEPTH*2;\n```\n= `32` (`0x20`)\n\n[<source>:4](<uri>#L4)",
+  "\n```systemverilog\nparameter int DEPTH=16;\n```\n"
+]

@@ -40,6 +40,10 @@
 
     Path to slang-server. Empty searches PATH and the directory containing the configured slang executable. Requires a binary compatible with this operating system.
 
+- `verilog.server.startupTimeout`: integer = 15 (1–600)
+
+    Seconds allowed for native initialization and the include-configuration handshake. Metadata indexing follows the handshake and does not consume this deadline.
+
 
 - `verilog.lint.slang.args`: string = ""
 

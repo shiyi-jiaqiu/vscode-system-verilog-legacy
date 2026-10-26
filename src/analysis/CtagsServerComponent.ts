@@ -255,20 +255,31 @@ export class CtagsServerComponent
 
     // Macro Completion
     if (context.triggerCharacter === '`') {
-      if (ext.server.active) {
-        const docs = [document, ...(await ext.index.dependencyDocuments(document))]
-        const symbols = (
-          await Promise.all(docs.map((doc) => ext.index.getVerilogDoc(doc).getSymbols({}, false)))
-        ).flat()
-        return symbols
-          .filter((symbol) => symbol.isMacro())
-          .map((symbol) => symbol.getCompletionItem())
+      const docs = [document, ...(await ext.index.dependencyDocuments(document))]
+      const symbols = (
+        await Promise.all(docs.map((doc) => ext.index.getVerilogDoc(doc).getSymbols({}, false)))
+      ).flat()
+      const items = new Map<string, vscode.CompletionItem>()
+      for (const symbol of symbols.filter((symbol) => symbol.isMacro())) {
+        if (!items.has(symbol.name)) {
+          items.set(
+            symbol.name,
+            macroCompletionItem(symbol.name, symbol.type, symbol.doc.lineAt(symbol.line).text)
+          )
+        }
       }
-      const macroCompletions = Array.from(ext.index.headerMacros, ([name, [kind, line]]) =>
-        macroCompletionItem(name, kind, line)
-      )
-      this.logger.info(`Returning ${macroCompletions.length} macro completions`)
-      return macroCompletions
+      // Global candidates remain useful when the project's compile order or include
+      // paths are incomplete; resolved local definitions keep priority.
+      for (const name of new Set([
+        ...ext.index.macroFiles.keys(),
+        ...ext.index.headerMacros.keys(),
+      ])) {
+        if (!items.has(name)) {
+          const cached = ext.index.headerMacros.get(name)
+          items.set(name, macroCompletionItem(name, cached?.[0] ?? 'define', cached?.[1] ?? ''))
+        }
+      }
+      return [...items.values()]
     }
 
     // Builtin Completion
@@ -289,7 +300,9 @@ export class CtagsServerComponent
         this.logger.info('Package not found')
         return []
       }
-      symbols = await ctags.getPackageSymbols()
+      symbols = (await ctags.getPackageSymbols()).filter(
+        (sym) => ctags.memberScope(sym) === pkgName
+      )
       this.logger.info(`Found ${symbols.length} completions in package ${pkgName}`)
     } else if (context.triggerCharacter === '.') {
       let parentScope = getParentText(document, new vscode.Range(position, position))
@@ -317,7 +330,9 @@ export class CtagsServerComponent
     } else {
       // this file
       this.logger.info('Fetching completions from current file')
-      symbols = await ext.index.getVerilogDoc(document).getSymbols()
+      const doc = ext.index.getVerilogDoc(document)
+      await doc.getSymbols()
+      symbols = await doc.visibleSymbols(doc.scopeAt(position))
 
       // wire width, ex: logic[some_param-1:0]
       // TODO: detect if we're in a functional block or not to restrict to params
@@ -343,15 +358,7 @@ export class CtagsServerComponent
 
     const word = document.getWordRangeAtPosition(position)
     const prefix = word ? document.getText(new vscode.Range(word.start, position)) : ''
-    const unit = ext.index.getVerilogDoc(document).unitAt(position)
-    symbols = symbols.filter(
-      (sym) =>
-        (!prefix || sym.name.startsWith(prefix)) &&
-        (!unit ||
-          sym.doc !== document ||
-          sym.parentScope === '' ||
-          sym.parentScope.split('.')[0] === unit)
-    )
+    symbols = symbols.filter((sym) => !prefix || sym.name.startsWith(prefix))
     additionalCompletions = additionalCompletions.filter(
       (item) =>
         !prefix ||
@@ -440,9 +447,9 @@ export class CtagsServerComponent
     // a macro used here is read here: names in it are looked up from this module
     const here = ext.index.getVerilogDoc(document)
     const site =
-      sym.isMacro() && pchar === '`' ? { doc: here, unit: here.unitAt(position) } : undefined
+      sym.isMacro() && pchar === '`' ? { doc: here, unit: here.scopeAt(position) } : undefined
     const steps: ValueStep[] = []
-    const value = await getConstValue(sym, site, steps)
+    const value = syms.length === 1 ? await getConstValue(sym, site, steps) : undefined
     const written = sym.isMacro() ? getMacroBody(sym) : getValueText(hover)
     if (value !== undefined && value.toString() !== written) {
       md.appendMarkdown(

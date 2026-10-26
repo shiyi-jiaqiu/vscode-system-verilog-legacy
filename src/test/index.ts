@@ -7,6 +7,7 @@ export function run(): Promise<void> {
   const mocha = new Mocha({
     ui: 'tdd',
   })
+  if (process.env.VERILOG_TEST_GREP) mocha.grep(process.env.VERILOG_TEST_GREP)
 
   const testsRoot = path.resolve(__dirname, '..')
 

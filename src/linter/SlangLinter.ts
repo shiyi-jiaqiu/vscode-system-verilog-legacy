@@ -2,16 +2,18 @@
 import * as child_process from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
+import * as os from 'os'
 import * as vscode from 'vscode'
 import { ext } from '../extension'
 import { ConfigObject, ExtensionComponent } from '../lib/libconfig'
 import { ToolConfig } from '../lib/runner'
-import { getWorkspaceFolder } from '../utils'
+import { getWorkspaceFolder, isAnyVerilog } from '../utils'
 import { SourceDependencies } from './SourceDependencies'
 import { hasTemplate } from '../Template'
+import { SavedInputs } from './SavedInputs'
 
 /// One entry of `slang --diag-json`; lines and columns count from 1, range ends are exclusive
-interface SlangDiagnostic {
+export interface SlangDiagnostic {
   severity: string
   message: string
   code: string
@@ -102,13 +104,14 @@ class SlangWarnings extends ExtensionComponent {
 }
 
 /// Consolidates missing dependency diagnostics without altering compiler input.
-function toDiagnostics(
+export function toDiagnostics(
   entries: SlangDiagnostic[],
   root: string,
   unlocated: string,
   sources: SourceDependencies,
   readingMode: boolean,
-  project: boolean
+  project: boolean,
+  inputs: SavedInputs
 ): Map<string, vscode.Diagnostic[]> {
   const files = new Map<string, vscode.Diagnostic[]>()
   const seen = new Set<string>()
@@ -116,6 +119,7 @@ function toDiagnostics(
   const repeats = new Map<vscode.Diagnostic, number>()
   // end of an unknown macro -> its diagnostic
   const macroEnds = new Map<string, vscode.Diagnostic>()
+  const unmapped = new Set<SlangDiagnostic>()
   const filePath = (file: string) => path.resolve(root, file)
   const parse = (entry: SlangDiagnostic): [string, vscode.Range] | undefined => {
     const match = /^(.*):(\d+):(\d+)$/.exec(entry.location ?? '')
@@ -123,18 +127,27 @@ function toDiagnostics(
       return undefined
     }
     const line = Number(match[2]) - 1
-    const column = Number(match[3]) - 1
+    const file = filePath(match[1])
+    const column = inputs.column(file, line, Number(match[3]) - 1)
+    if (column === undefined) {
+      unmapped.add(entry)
+    }
+
     const ranges = (entry.ranges ?? [])
-      .filter((r) => r.start.file === match[1] && r.end.file === match[1])
-      .map(
-        (r) =>
-          new vscode.Range(r.start.line - 1, r.start.column - 1, r.end.line - 1, r.end.column - 1)
-      )
+      .filter((r) => filePath(r.start.file) === file && filePath(r.end.file) === file)
+      .flatMap((r) => {
+        const start = inputs.column(file, r.start.line - 1, r.start.column - 1)
+        const end = inputs.column(file, r.end.line - 1, r.end.column - 1)
+        return start === undefined || end === undefined
+          ? []
+          : [new vscode.Range(r.start.line - 1, start, r.end.line - 1, end)]
+      })
     const range = ranges.reduce(
       (all, r) => all.union(r),
-      ranges.at(0) ?? new vscode.Range(line, column, line, column + 1)
+      ranges.at(0) ??
+        new vscode.Range(line, column ?? 0, line, column === undefined ? 0 : column + 1)
     )
-    return [filePath(match[1]), range]
+    return [file, range]
   }
 
   const missingCodes = new Set([
@@ -241,6 +254,9 @@ function toDiagnostics(
     }
 
     let message = entry.message
+    if (at && unmapped.has(entry)) {
+      message += ` [${entry.location}; saved source unavailable, UTF-16 column unknown]`
+    }
     if (at === undefined && entry.code === 'TooManyErrors') {
       message =
         'slang stopped at its error limit, so files after this point were not checked. Fix the repeated error, or raise the limit with --error-limit in verilog.lint.slang.args.'
@@ -272,7 +288,9 @@ function toDiagnostics(
         : [
             new vscode.DiagnosticRelatedInformation(
               new vscode.Location(vscode.Uri.file(noteAt[0]), noteAt[1]),
-              note.message
+              unmapped.has(note)
+                ? `${note.message} [${note.location}; UTF-16 column unknown]`
+                : note.message
             ),
           ]
     })
@@ -354,13 +372,27 @@ export default class SlangLinter extends ToolConfig {
   })
 
   private diagnostics = vscode.languages.createDiagnosticCollection('slang')
-  private raw = new Map<string, { input: 'saved files'; diagnostics: SlangDiagnostic[] }>()
+  private raw = new Map<
+    string,
+    {
+      input: 'saved files'
+      diagnostics: SlangDiagnostic[]
+      status?: string
+      version?: number
+      completedAt?: string
+    }
+  >()
 
   rawDiagnostics(uri: vscode.Uri): unknown {
     return this.raw.get(uri.fsPath) ?? this.raw.get('') ?? { status: 'No CLI result received yet' }
   }
   /// The empty key is the project; other keys are individually checked file paths.
-  private runs = new Map<string, { process?: child_process.ChildProcess }>()
+  private runs = new Map<
+    string,
+    { process?: child_process.ChildProcess; inputs: Set<string>; edited: Set<string> }
+  >()
+  private checkedInputs = new Map<string, Set<string>>()
+  statusMessage: string | undefined
   private queue: Promise<void> = Promise.resolve()
 
   constructor() {
@@ -368,10 +400,56 @@ export default class SlangLinter extends ToolConfig {
   }
 
   async activate(context: vscode.ExtensionContext): Promise<void> {
-    context.subscriptions.push(this.diagnostics)
+    context.subscriptions.push(
+      this.diagnostics,
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        if (event.contentChanges.length && isAnyVerilog(event.document.languageId)) {
+          this.invalidate(event.document.uri.fsPath)
+        }
+      })
+    )
     if (this.enabled.getValue() && !ext.server.enabled.getValue()) {
       await this.path.checkPathNotify()
     }
+  }
+
+  private invalidate(file: string) {
+    const affected = ext.server.dependencies.affectedBy(new Set([file]))
+    affected.add(file)
+    for (const [key, run] of this.runs) {
+      run.edited.add(file)
+      if ([...affected].some((input) => run.inputs.has(input))) {
+        run.process?.kill()
+        this.runs.delete(key)
+      }
+    }
+    if (this.checkedInputs.get('')?.has(file)) {
+      this.diagnostics.clear()
+      this.raw.delete('')
+    }
+    for (const [key, inputs] of this.checkedInputs) {
+      if (key && inputs.has(file)) {
+        affected.add(key)
+      }
+    }
+    for (const changed of affected) {
+      this.diagnostics.delete(vscode.Uri.file(changed))
+      this.raw.delete(changed)
+    }
+    const project = this.raw.get('')
+    if (project) {
+      const root = getWorkspaceFolder() ?? ''
+      const touches = (entry: SlangDiagnostic): boolean => {
+        const at = /^(.*):\d+:\d+$/.exec(entry.location ?? '')
+        return (
+          !!(at && affected.has(path.resolve(root, at[1]))) || (entry.notes ?? []).some(touches)
+        )
+      }
+      project.diagnostics = project.diagnostics.filter((entry) => !touches(entry))
+      project.status = 'Changed-file results cleared; other results describe saved inputs'
+    }
+    this.statusMessage = 'Save changed inputs to refresh CLI diagnostics'
+    ext.server.refreshRawDiagnostics()
   }
 
   /// Stops a running check and drops all diagnostics
@@ -380,8 +458,11 @@ export default class SlangLinter extends ToolConfig {
       run.process?.kill()
     }
     this.runs.clear()
+    this.checkedInputs.clear()
+    this.statusMessage = undefined
     this.diagnostics.clear()
     this.raw.clear()
+    ext.server.refreshRawDiagnostics()
   }
 
   clear(uri: vscode.Uri) {
@@ -389,6 +470,7 @@ export default class SlangLinter extends ToolConfig {
     this.runs.delete(uri.fsPath)
     this.diagnostics.delete(uri)
     this.raw.delete(uri.fsPath)
+    ext.server.refreshRawDiagnostics(uri)
   }
 
   async lint(doc: vscode.TextDocument | undefined): Promise<void> {
@@ -411,7 +493,13 @@ export default class SlangLinter extends ToolConfig {
     }
     const key = project ? '' : target!
     this.runs.get(key)?.process?.kill()
-    const run: { process?: child_process.ChildProcess } = {}
+    const run: { process?: child_process.ChildProcess; inputs: Set<string>; edited: Set<string> } =
+      {
+        inputs: new Set(target ? [target] : []),
+        edited: new Set(),
+      }
+    const fail = (reason: string) => this.reportFailure(reason, key)
+    let temporary: string | undefined
     this.runs.set(key, run)
     const current = () => this.runs.get(key) === run && this.enabled.getValue()
 
@@ -429,6 +517,9 @@ export default class SlangLinter extends ToolConfig {
       const sources = ext.server.dependencies
       const cacheDir = ext.index.cacheDir?.fsPath
       const inputFiles = project ? (filelist?.files ?? [target!]) : [target!]
+      for (const file of inputFiles) {
+        run.inputs.add(file)
+      }
       const affected = await sources.update(inputFiles, filelist?.incdirs ?? [])
       if (!current()) {
         return
@@ -445,6 +536,12 @@ export default class SlangLinter extends ToolConfig {
         } else {
           this.diagnostics.delete(doc!.uri)
         }
+        this.raw.set(key, {
+          input: 'saved files',
+          diagnostics: [],
+          status: 'Skipped: unexpanded Perl template',
+        })
+        ext.server.refreshRawDiagnostics(project ? undefined : doc?.uri)
         this.logger.info(
           'Semantic check skipped: unexpanded Perl template in source or included header'
         )
@@ -455,6 +552,25 @@ export default class SlangLinter extends ToolConfig {
         }
         return
       }
+      const paths = new Set(inputFiles.flatMap((file) => [file, ...sources.dependenciesOf(file)]))
+      run.inputs = paths
+      if (
+        vscode.workspace.textDocuments.some((open) => open.isDirty && paths.has(open.uri.fsPath))
+      ) {
+        this.statusMessage = 'Save changed sources and headers before CLI lint'
+        ext.server.refreshRawDiagnostics(project ? undefined : doc?.uri)
+        return
+      }
+      const inputs = new SavedInputs(
+        (file) =>
+          vscode.workspace.getConfiguration('files', vscode.Uri.file(file)).get('encoding', 'utf8'),
+        (file) =>
+          vscode.workspace.textDocuments
+            .find((doc) => doc.uri.fsPath === file && !doc.isDirty)
+            ?.getText()
+      )
+      await inputs.capture(paths)
+      const version = doc?.version
       const extraArgs = this.args.getValue().split(/\s+/).filter(Boolean)
       const analysis = extraArgs.includes('--parse-only')
         ? 'syntax'
@@ -495,6 +611,17 @@ export default class SlangLinter extends ToolConfig {
         args.push('--ignore-unknown-modules')
       }
       args = args.concat(extraArgs.filter((arg) => arg !== '--parse-only' && arg !== '--lint-only'))
+      // This protocol option is owned by the extension. Do not let extra args silently
+      // change the coordinate unit; unsupported old CLIs fail visibly instead of mislocating.
+      args = args.filter(
+        (arg, index) =>
+          !arg.startsWith('--diag-column-unit=') &&
+          arg !== '--diag-column-unit' &&
+          args[index - 1] !== '--diag-column-unit'
+      )
+      temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'verilog-cli-'))
+      const dependenciesFile = path.join(temporary, 'dependencies.txt')
+      args.push('--diag-column-unit=byte', '--all-deps', dependenciesFile)
       // the check that diagnostics without a place in the code are shown on
       const unlocated = project ? (filelist?.path ?? target!) : target!
       const command = this.path.getValue()
@@ -517,9 +644,7 @@ export default class SlangLinter extends ToolConfig {
             const json = /^\[$[\s\S]*^\]$/m.exec(out)
             // slang exits with 1 when it reports errors; anything else means it did not finish
             if (error !== null && typeof error.code !== 'number') {
-              this.reportFailure(
-                error.signal ? `stopped by ${error.signal}` : error.message.split('\n')[0]
-              )
+              fail(error.signal ? `stopped by ${error.signal}` : error.message.split('\n')[0])
               resolve(undefined)
             } else if (analysis === 'syntax') {
               const parsed: SlangDiagnostic[] = Array.from(
@@ -566,14 +691,14 @@ export default class SlangLinter extends ToolConfig {
                 })
               }
               if (error !== null && parsed.length === 0) {
-                this.reportFailure(err.trim().split('\n')[0] || `exit code ${error.code}`)
+                fail(err.trim().split('\n')[0] || `exit code ${error.code}`)
                 resolve(undefined)
               } else {
                 resolve(JSON.stringify(parsed))
               }
             } else if (json === null) {
               // such as for an unknown argument
-              this.reportFailure(err.trim().split('\n')[0] || `exit code ${error?.code}`)
+              fail(err.trim().split('\n')[0] || `exit code ${error?.code}`)
               resolve(undefined)
             } else {
               resolve(json[0])
@@ -589,7 +714,53 @@ export default class SlangLinter extends ToolConfig {
       try {
         entries = JSON.parse(stdout)
       } catch (e) {
-        this.reportFailure(`unreadable diagnostics: ${e}`)
+        fail(`unreadable diagnostics: ${e}`)
+        return
+      }
+      const located = new Set<string>()
+      const collect = (entry: SlangDiagnostic) => {
+        const at = /^(.*):\d+:\d+$/.exec(entry.location ?? '')
+        if (at) {
+          located.add(path.resolve(root, at[1]))
+        }
+        for (const range of entry.ranges ?? []) {
+          located.add(path.resolve(root, range.start.file))
+          located.add(path.resolve(root, range.end.file))
+        }
+        for (const note of entry.notes ?? []) {
+          collect(note)
+        }
+      }
+      entries.forEach(collect)
+      const discovered = (await fs.promises.readFile(dependenciesFile, 'utf8').catch(() => ''))
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((file) => path.resolve(root, file))
+      // Retain actual compiler inputs for later edits; no source text is loaded here.
+      for (const file of [...discovered, ...located]) {
+        run.inputs.add(file)
+      }
+      await inputs.discover(discovered)
+      await inputs.load(located)
+      const dirty = vscode.workspace.textDocuments.some(
+        (open) => open.isDirty && run.inputs.has(open.uri.fsPath)
+      )
+      const edited = [...run.edited].some((file) => run.inputs.has(file))
+      if (!current() || dirty || edited || !(await inputs.unchanged())) {
+        if (current()) {
+          this.raw.set(key, {
+            input: 'saved files',
+            diagnostics: [],
+            status: 'Input changed during CLI lint; save and run again',
+          })
+          this.statusMessage = 'Input changed during CLI lint; save and run again'
+          for (const open of vscode.workspace.textDocuments) {
+            if (open.isDirty && run.inputs.has(open.uri.fsPath)) {
+              this.diagnostics.delete(open.uri)
+            }
+          }
+          ext.server.refreshRawDiagnostics(project ? undefined : doc?.uri)
+        }
         return
       }
       const files = toDiagnostics(
@@ -598,7 +769,8 @@ export default class SlangLinter extends ToolConfig {
         unlocated,
         sources,
         this.readingMode.getValue(),
-        project
+        project,
+        inputs
       )
       if (project && filelist === undefined && ext.index.cacheDir !== undefined) {
         // modules found through -y are reported at their links
@@ -613,7 +785,15 @@ export default class SlangLinter extends ToolConfig {
       if (!current()) {
         return
       }
-      this.raw.set(project ? '' : doc!.uri.fsPath, { input: 'saved files', diagnostics: entries })
+      this.checkedInputs.set(key, new Set(run.inputs))
+      this.statusMessage = undefined
+      this.raw.set(key, {
+        input: 'saved files',
+        diagnostics: entries,
+        version,
+        completedAt: new Date().toISOString(),
+      })
+      ext.server.refreshRawDiagnostics(project ? undefined : doc?.uri)
       if (project) {
         this.diagnostics.clear()
         for (const [file, diags] of files) {
@@ -647,18 +827,31 @@ export default class SlangLinter extends ToolConfig {
       }
     } catch (error) {
       if (current()) {
-        this.reportFailure(String(error))
+        fail(String(error))
       }
     } finally {
       if (this.runs.get(key) === run) {
         this.runs.delete(key)
       }
+      if (temporary) {
+        await fs.promises.rm(temporary, { recursive: true, force: true })
+      }
       release()
     }
   }
 
-  /// Keeps the diagnostics of the last finished check
-  private reportFailure(reason: string) {
+  /// Clear stale results and make the failed check visible in Raw diagnostics.
+  private reportFailure(reason: string, key: string) {
+    if (key) {
+      this.diagnostics.delete(vscode.Uri.file(key))
+    }
+    this.statusMessage = `CLI check failed: ${reason}`
+    this.raw.set(key, {
+      input: 'saved files',
+      diagnostics: [],
+      status: `CLI check failed: ${reason}`,
+    })
+    ext.server.refreshRawDiagnostics()
     this.logger.error(`slang did not finish: ${reason}`)
     vscode.window.showErrorMessage(`slang did not finish: ${reason}`)
   }
