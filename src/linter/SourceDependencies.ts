@@ -2,13 +2,11 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { includeCandidates } from '../Filelist'
-import { hasTemplate } from '../Template'
 
 interface Entry {
   stamp: string
   includes: string[]
   dependencies: string[]
-  template: boolean
 }
 
 export interface IncludePolicy {
@@ -16,7 +14,6 @@ export interface IncludePolicy {
   incDirFirst?: boolean
 }
 
-/// Metadata only: never invent compiler input for unexpanded templates.
 export class SourceDependencies {
   private entries = new Map<string, Entry>()
   private queue: Promise<unknown> = Promise.resolve()
@@ -26,7 +23,7 @@ export class SourceDependencies {
     incdirs: string[],
     buffers: ReadonlyMap<string, string> = new Map(),
     policy: IncludePolicy = {}
-  ): Promise<Set<string>> {
+  ): Promise<void> {
     const result = this.queue
       .catch(() => {})
       .then(() => this.scan(sources, incdirs, buffers, policy))
@@ -39,10 +36,9 @@ export class SourceDependencies {
     incdirs: string[],
     buffers: ReadonlyMap<string, string>,
     policy: IncludePolicy
-  ): Promise<Set<string>> {
+  ): Promise<void> {
     const seen = new Set(sources)
     const queue = [...seen]
-    const templates = new Set<string>()
     // Shared headers and missing include candidates need at most one stat per scan.
     const stats = new Map<string, Promise<fs.Stats | undefined>>()
     const stat = (file: string) => {
@@ -68,12 +64,8 @@ export class SourceDependencies {
           stamp: buffers.has(file) ? '' : stamp,
           includes: Array.from(text.matchAll(/^[ \t]*`include[ \t]+"([^"]+)"/gm), (m) => m[1]),
           dependencies: [],
-          template: hasTemplate(text),
         }
         this.entries.set(file, entry)
-      }
-      if (entry.template) {
-        templates.add(file)
       }
       entry.dependencies = []
       for (const name of entry.includes) {
@@ -100,7 +92,6 @@ export class SourceDependencies {
         }
       }
     }
-    return this.affectedBy(templates)
   }
 
   affectedBy(files: Set<string>): Set<string> {

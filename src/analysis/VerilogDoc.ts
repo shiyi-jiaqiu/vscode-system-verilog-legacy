@@ -5,7 +5,6 @@ import * as path from 'path'
 import * as vscode from 'vscode'
 import { ext } from '../extension'
 import { Logger } from '../lib/logger'
-import { maskTemplate } from '../Template'
 import { Symbol } from './Symbol'
 // select one
 interface SymbolFilter {
@@ -166,10 +165,11 @@ export class VerilogDoc {
       visible.add(scope)
       scopes.set(sym, visible)
     }
-    const text = maskTemplate(this.doc.getText()).text.replace(
-      /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g,
-      (part) => part.replace(/[^\r\n]/g, ' ')
-    )
+    const text = this.doc
+      .getText()
+      .replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g, (part) =>
+        part.replace(/[^\r\n]/g, ' ')
+      )
     const importRe = /\bimport\s+([A-Za-z_]\w*)\s*::\s*(\*|[A-Za-z_]\w*)\s*;/g
     for (const match of text.matchAll(importRe)) {
       const doc = await ext.index.findFile(match[1])
@@ -226,7 +226,7 @@ export class VerilogDoc {
       os.tmpdir(),
       `vscode-verilog-${process.pid}-${++ctagsInputCount}${path.extname(this.doc.fileName)}`
     )
-    await fs.promises.writeFile(input, maskMacroCalls(maskTemplate(text, true).text))
+    await fs.promises.writeFile(input, maskMacroCalls(text))
     let args: string[] =
       '-f - --fields=+K --sort=no --excmd=n --fields-SystemVerilog=+{parameter}'.split(' ')
     args.push(...CTAGS_MAPS)
@@ -314,10 +314,11 @@ export class VerilogDoc {
         {
           // Pair lexical delimiters, including unnamed begin/end frames, so a nested
           // declaration cannot leak into its siblings. Mask comments and strings first.
-          const text = maskTemplate(this.doc.getText()).text.replace(
-            /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g,
-            (part) => part.replace(/[^\r\n]/g, ' ')
-          )
+          const text = this.doc
+            .getText()
+            .replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g, (part) =>
+              part.replace(/[^\r\n]/g, ' ')
+            )
           const frames: { kind: string; symbol?: Symbol; start: number }[] = []
           const byKind = new Map<string, Symbol[]>()
           for (const symbol of this.symbols) {

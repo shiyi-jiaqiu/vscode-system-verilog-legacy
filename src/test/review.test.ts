@@ -218,19 +218,6 @@ suite('Independent review regressions', function () {
     await setting('filelist', '')
   })
 
-  test('F12: template names produce neither fragments, types nor placeholders in outline', async () => {
-    const doc = await open(
-      'dynamic.sv',
-      'module dynamic;\nparameter int N_<pl>$i</pl> = 1;\nparameter int <pl>$name</pl> = 2;\nlogic sig_<pl>$i</pl>;\nlogic stable;\nendmodule\n'
-    )
-    const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-      'vscode.executeDocumentSymbolProvider',
-      doc.uri
-    )
-    const names = (symbols ?? []).flatMap((s) => [s.name, ...s.children.map((c) => c.name)])
-    assert.deepStrictEqual(names, ['dynamic', 'stable'])
-  })
-
   test('F05: syntax/local/full CLI columns and notes match Unicode text', async () => {
     for (const analysis of ['syntax', 'local', 'full']) {
       await setting('lint.slang.analysis', analysis)
@@ -443,26 +430,28 @@ suite('Independent review regressions', function () {
       'native-template.sv',
       '`include "template.svh"\nmodule native_template; endmodule\n'
     )
+    await until(() => ext.server.owns(templateUser), 'markup includer uses native analysis')
     await until(
-      () => ext.server.isSkipped(templateUser),
-      'native-only include routes template dependency to static browsing'
+      () =>
+        ((ext.server as any).rawDiagnostics.get(
+          vscode.Uri.file(path.join(inc, 'template.svh')).toString()
+        )?.diagnostics.length ?? 0) > 0,
+      'markup include receives ordinary syntax diagnostics'
     )
-    assert.strictEqual(ext.server.owns(templateUser), false)
     const shadowUser = await open(
       'native-shadow.sv',
       '`include "shadow.svh"\nmodule native_shadow; localparam int W=`WIDTH; endmodule\n'
     )
     await until(() => ext.server.owns(shadowUser), 'ordinary include initially uses native')
-    const local = await open('shadow.svh', '<pl>$shadow</pl>\n')
+    const local = await open('shadow.svh', '// <pl>$shadow</pl>\n`define WIDTH 12\n')
     // Trigger a real editor save. The includer is deliberately left untouched.
-    await replace(local, '<pl>$shadow2</pl>\n')
+    await replace(local, '// <pl>$shadow2</pl>\n`define WIDTH 16\n')
     await local.save()
-    await until(() => ext.server.isSkipped(shadowUser), 'new local template header shadows incdir')
-    assert.strictEqual(ext.server.owns(shadowUser), false)
-    await replace(local, '`define WIDTH 16\n')
-    await local.save()
-    await until(() => ext.server.owns(shadowUser), 'removing template marker restores native route')
-    assert.match(await hover(shadowUser, 'W='), /\b16\b/)
+    assert.ok(ext.server.owns(shadowUser), 'markup in comments must not change native ownership')
+    await until(
+      async () => /\b16\b/.test(await hover(shadowUser, 'W=')),
+      'saved local header updates the native value'
+    )
 
     const dirty = await open(
       'native-dirty.sv',

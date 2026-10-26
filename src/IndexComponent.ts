@@ -6,7 +6,6 @@ import { CTAGS_MAPS, maskMacroCalls, VerilogDoc } from './analysis/VerilogDoc'
 import { ext } from './extension'
 import { ExtensionComponent } from './lib/libconfig'
 import { getParentText, getPrevChar, isAnyVerilog } from './utils'
-import { hasTemplate, maskTemplate } from './Template'
 import fs = require('fs')
 import os = require('os')
 import path = require('path')
@@ -202,28 +201,10 @@ export class IndexComponent extends ExtensionComponent {
     if (files.length === 0) {
       return
     }
-    const temp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'verilog-names-'))
-    const inputs = files.map((file) => file.fsPath)
-    const originals = new Map<string, string>()
-    let stdout: string
-    try {
-      for (let i = 0; i < files.length; i += 16) {
-        await Promise.all(
-          files.slice(i, i + 16).map(async (file, j) => {
-            const text = await fs.promises.readFile(file.fsPath, 'utf8')
-            if (hasTemplate(text)) {
-              const copy = path.join(temp, `${i + j}${path.extname(file.fsPath)}`)
-              await fs.promises.writeFile(copy, maskTemplate(text, true).text)
-              inputs[i + j] = copy
-              originals.set(copy, file.fsPath)
-            }
-          })
-        )
-      }
-      stdout = await this.ctags(inputs, '--kinds-SystemVerilog=mIKCPd --kinds-Verilog=md')
-    } finally {
-      await fs.promises.rm(temp, { recursive: true, force: true })
-    }
+    const stdout = await this.ctags(
+      files.map((file) => file.fsPath),
+      '--kinds-SystemVerilog=mIKCPd --kinds-Verilog=md'
+    )
     if (ext.server.active || ext.server.pending || ext.slangExtensionActive()) {
       return
     }
@@ -246,7 +227,7 @@ export class IndexComponent extends ExtensionComponent {
       if (kind === undefined || name === '_') {
         continue
       }
-      const uri = vscode.Uri.file(originals.get(file) ?? file)
+      const uri = vscode.Uri.file(file)
       if (kind === 'define') {
         const uris = this.macroFiles.get(name) ?? []
         if (!uris.some((u) => u.fsPath === uri.fsPath)) {
@@ -340,10 +321,7 @@ export class IndexComponent extends ExtensionComponent {
                 await Promise.all(
                   files.slice(i, i + 16).map(async (file, j) => {
                     const text = await fs.promises.readFile(file.fsPath, 'utf8').catch(() => '')
-                    await fs.promises.writeFile(
-                      copies[i + j],
-                      maskMacroCalls(maskTemplate(text, true).text)
-                    )
+                    await fs.promises.writeFile(copies[i + j], maskMacroCalls(text))
                   })
                 )
               }

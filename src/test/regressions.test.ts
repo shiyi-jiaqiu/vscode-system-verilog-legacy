@@ -158,7 +158,7 @@ suite('Review regressions', function () {
     assert.ok(!ext.index.moduleMap.has('p'))
   })
 
-  test('deleted and shadowed includes update the template dependency graph', async () => {
+  test('deleted and shadowed includes update the dependency graph', async () => {
     const root = path.join(dir, 'mirror-input')
     const include = path.join(root, 'inc')
     await fs.promises.mkdir(include, { recursive: true })
@@ -166,15 +166,18 @@ suite('Review regressions', function () {
     const local = path.join(root, 'defs.svh')
     const other = path.join(include, 'defs.svh')
     await fs.promises.writeFile(file, '`include "defs.svh"\nmodule top; endmodule\n')
-    await fs.promises.writeFile(local, '<pl>1</pl>\n')
-    await fs.promises.writeFile(other, '<pl>2</pl>\n')
+    await fs.promises.writeFile(local, '`define VALUE 1\n')
+    await fs.promises.writeFile(other, '`define VALUE 2\n')
     const sources = new SourceDependencies()
-    assert.ok((await sources.update([file], [include])).has(file))
+    await sources.update([file], [include])
+    assert.deepStrictEqual([...sources.dependenciesOf(file)], [local])
     await fs.promises.unlink(local)
-    assert.ok((await sources.update([file], [include])).has(file))
+    await sources.update([file], [include])
+    assert.deepStrictEqual([...sources.dependenciesOf(file)], [other])
     assert.ok(!sources.affectedBy(new Set([local])).has(file))
     await fs.promises.unlink(other)
-    assert.ok(!(await sources.update([file], [include])).has(file))
+    await sources.update([file], [include])
+    assert.strictEqual(sources.dependenciesOf(file).size, 0)
   })
 
   test('include navigation selects the includer directory before incdir', async () => {
@@ -198,7 +201,7 @@ suite('Review regressions', function () {
     assert.strictEqual(evalConst('(8 + 2) * 4'), 40n)
   })
 
-  test('unexpanded Perl files skip semantic checks and retain only static declarations', async () => {
+  test('unexpanded markup receives ordinary CLI syntax diagnostics', async () => {
     await vscode.workspace
       .getConfiguration('verilog')
       .update('lint.slang.analysis', 'full', vscode.ConfigurationTarget.Workspace)
@@ -224,11 +227,9 @@ suite('Review regressions', function () {
     const doc = await vscode.workspace.openTextDocument(file)
     await ext.lint.slang.lint(doc)
     const diagnostics = vscode.languages.getDiagnostics(doc.uri)
-    assert.deepStrictEqual(diagnostics, [])
-    assert.ok(ext.server.isSkipped(doc))
-    const names = (await ext.index.getVerilogDoc(doc).getSymbols()).map((symbol) => symbol.name)
-    assert.ok(names.includes('a'))
-    assert.ok(!names.includes('foo_'))
+    assert.ok(
+      diagnostics.some((diagnostic) => diagnostic.severity === vscode.DiagnosticSeverity.Error)
+    )
   })
 
   test('disabling single-file lint discards a running check', async () => {
@@ -281,16 +282,21 @@ suite('Review regressions', function () {
     const source = await vscode.workspace.openTextDocument(file)
     await vscode.window.showTextDocument(source, { preview: false })
     await ext.lint.slang.lint(source)
-    assert.ok(!ext.server.isSkipped(source))
+    assert.deepStrictEqual(vscode.languages.getDiagnostics(source.uri), [])
     const header = await vscode.workspace.openTextDocument(include)
     const edit = new vscode.WorkspaceEdit()
-    edit.insert(header.uri, new vscode.Position(0, 0), '<pl>$i</pl>\n')
+    edit.replace(header.uri, new vscode.Range(0, 0, header.lineCount, 0), '`define VALUE MISSING\n')
     await vscode.workspace.applyEdit(edit)
     await header.save()
-    for (let i = 0; i < 50 && !ext.server.isSkipped(source); i++) {
+    for (let i = 0; i < 50 && vscode.languages.getDiagnostics(source.uri).length === 0; i++) {
       await pause(100)
     }
-    assert.ok(ext.server.isSkipped(source), 'the includer must stop semantic checks')
+    assert.ok(
+      vscode.languages
+        .getDiagnostics(source.uri)
+        .some((diagnostic) => diagnostic.message.includes('MISSING')),
+      'the includer must be checked against the saved header'
+    )
     await vscode.workspace
       .getConfiguration('verilog')
       .update('lint.slang.runOnSave', false, vscode.ConfigurationTarget.Workspace)

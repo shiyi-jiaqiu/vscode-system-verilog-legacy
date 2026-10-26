@@ -1,23 +1,24 @@
-# Native server for extension 0.6.1
+# Native server for extension 0.6.2
 
 `slang-server-legacy.patch` applies to upstream
 [60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c),
 with its direct submodules initialized. The resulting server identifies itself as
-`0.3.1+60857ce-legacy0.6.1`. Keep upstream MIT notices.
+`0.3.1+60857ce-legacy0.6.2`. Keep upstream MIT notices.
 
 This revision changes both the client and native service. Rebuild and upgrade both.
 The client waits for `slang/includeConfiguration` after initialization, then uses
-those effective directories and include-search policies to route literal template
-dependencies. Older binaries without that notification fall back after the startup
-timeout. No Perl code is executed.
+those effective directories and include-search policies for include resolution.
+Older binaries without that notification fall back after the startup timeout.
+Version 0.6.2 removes embedded-script/template exclusions; rebuild both
+components to replace the behavior shipped in 0.6.1.
 
 The patch retains mandatory UTF-16 positions and versioned diagnostics from the
 original 0.6.0 patch. It additionally repairs live reference candidates, disk include
-invalidation, template exclusion, preprocessor-aware metadata, index replacement,
+invalidation, preprocessor-aware metadata, index replacement,
 configuration-failure recovery, hover links, workspace-symbol ranges, diagnostic
 codes and optional completion context. `diagnosticWarnings` remains an additive
 list of options without `-W`; warning-only refresh reuses analysis. Changes to
-preprocessor definitions or include configuration rebuild metadata as well. Ordinary metadata parsing avoids include expansion, with full preprocessing for files containing conditional directives, dynamic declarations or macro include paths. Compact header summaries retain template and precise include-candidate dependencies; worker SourceManagers release each primary buffer after extracting metadata. Initial indexing follows `initialized`, after the include-configuration notification, so it does not consume the client handshake timeout. See [follow-up verification](tests/review2.md).
+preprocessor definitions or include configuration rebuild metadata as well. Ordinary metadata parsing avoids include expansion, with full preprocessing for files containing conditional directives, dynamic declarations or macro include paths. Compact header summaries retain precise include-candidate dependencies; worker SourceManagers release each primary buffer after extracting metadata. Initial indexing follows `initialized`, after the include-configuration notification, so it does not consume the client handshake timeout. See [follow-up verification](tests/review2.md).
 
 ## Apply and build
 
@@ -45,7 +46,7 @@ from upstream; existing caches can be supplied through the usual
 
 ## Target ABI
 
-The 0.6.1 Linux x86_64 binary is built with GCC 11.4 and a glibc 2.17
+The 0.6.2 Linux x86_64 binary is built with GCC 11.4 and a glibc 2.17
 sysroot derived from CentOS 7.9 packages. Add these options to the build above:
 
 ```sh

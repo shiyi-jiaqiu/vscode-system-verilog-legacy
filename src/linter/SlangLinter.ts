@@ -9,7 +9,6 @@ import { ConfigObject, ExtensionComponent } from '../lib/libconfig'
 import { ToolConfig } from '../lib/runner'
 import { getWorkspaceFolder, isAnyVerilog } from '../utils'
 import { SourceDependencies } from './SourceDependencies'
-import { hasTemplate } from '../Template'
 import { SavedInputs } from './SavedInputs'
 
 /// One entry of `slang --diag-json`; lines and columns count from 1, range ends are exclusive
@@ -520,36 +519,8 @@ export default class SlangLinter extends ToolConfig {
       for (const file of inputFiles) {
         run.inputs.add(file)
       }
-      const affected = await sources.update(inputFiles, filelist?.incdirs ?? [])
+      await sources.update(inputFiles, filelist?.incdirs ?? [])
       if (!current()) {
-        return
-      }
-      const template =
-        inputFiles.some((file) => affected.has(file)) ||
-        (doc !== undefined && hasTemplate(doc.getText()))
-      if (doc) {
-        ext.server.markSkipped(doc.uri, template)
-      }
-      if (template) {
-        if (project) {
-          this.diagnostics.clear()
-        } else {
-          this.diagnostics.delete(doc!.uri)
-        }
-        this.raw.set(key, {
-          input: 'saved files',
-          diagnostics: [],
-          status: 'Skipped: unexpanded Perl template',
-        })
-        ext.server.refreshRawDiagnostics(project ? undefined : doc?.uri)
-        this.logger.info(
-          'Semantic check skipped: unexpanded Perl template in source or included header'
-        )
-        if (project) {
-          vscode.window.showInformationMessage(
-            'Project check skipped: unexpanded Perl templates. Use open-files scope to check ordinary sources.'
-          )
-        }
         return
       }
       const paths = new Set(inputFiles.flatMap((file) => [file, ...sources.dependenciesOf(file)]))

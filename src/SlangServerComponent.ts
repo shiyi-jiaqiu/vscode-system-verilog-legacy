@@ -19,7 +19,6 @@ import {
 import { ext } from './extension'
 import { CommandNode, ConfigObject, ExtensionComponent } from './lib/libconfig'
 import { SourceDependencies } from './linter/SourceDependencies'
-import { hasTemplate } from './Template'
 import { anyVerilogSelector, getWorkspaceFolder, isAnyVerilog } from './utils'
 
 // LanguageClient 9 calls stop() after initialize rejects, even though LSP shutdown
@@ -65,7 +64,7 @@ export class SlangServerComponent extends ExtensionComponent {
   enabled = new ConfigObject<boolean>({
     default: true,
     description:
-      'Use slang-server for standard Verilog navigation and diagnostics when available. Falls back to ctags and slang CLI if unavailable. Perl templates use static browsing only.',
+      'Use slang-server for standard Verilog navigation and diagnostics when available. Falls back to ctags and slang CLI if unavailable.',
   })
   path = new ConfigObject<string>({
     default: '',
@@ -86,7 +85,6 @@ export class SlangServerComponent extends ExtensionComponent {
   private client: LanguageClient | undefined
   private sent = new Set<string>()
   private opening = new Map<string, Promise<void>>()
-  private skipped = new Set<string>()
   private diagnostics = new Map<string, vscode.Diagnostic[]>()
   private diagnosticVersions = new Map<string, number | undefined>()
   private rawDiagnostics = new Map<string, PublishDiagnosticsParams>()
@@ -97,8 +95,6 @@ export class SlangServerComponent extends ExtensionComponent {
   private state = 'initializing'
   private initialized = false
   private stopping = false
-  private headerChange: ReturnType<typeof setTimeout> | undefined
-  private changedSources = new Set<string>()
   private configChange: ReturnType<typeof setTimeout> | undefined
   private process: ChildProcess | undefined
   private cancelStart: (() => void) | undefined
@@ -129,20 +125,8 @@ export class SlangServerComponent extends ExtensionComponent {
     return this.state === 'initializing' || this.state === 'starting'
   }
   owns(doc: vscode.TextDocument): boolean {
-    return this.active && this.sent.has(doc.uri.toString()) && !this.isSkipped(doc)
+    return this.active && this.sent.has(doc.uri.toString())
   }
-  isSkipped(doc: vscode.TextDocument): boolean {
-    return hasTemplate(doc.getText()) || this.skipped.has(doc.uri.toString())
-  }
-  markSkipped(uri: vscode.Uri, skip: boolean) {
-    if (skip) {
-      this.skipped.add(uri.toString())
-    } else {
-      this.skipped.delete(uri.toString())
-    }
-    this.updateStatus()
-  }
-
   async findUnit(name: string): Promise<vscode.Uri | undefined> {
     if (!this.client || !this.active || !/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name)) {
       return undefined
@@ -187,10 +171,6 @@ export class SlangServerComponent extends ExtensionComponent {
     const watcher = vscode.workspace.createFileSystemWatcher('**/*.{sv,v,svh,vh}')
     const changed = () => {
       ext.index.revision++
-      clearTimeout(this.headerChange)
-      this.headerChange = setTimeout(() => {
-        void this.syncDependents().catch((error) => this.logger.error(String(error)))
-      }, 200)
     }
     context.subscriptions.push(
       watcher,
@@ -227,19 +207,17 @@ export class SlangServerComponent extends ExtensionComponent {
         if (
           this.active &&
           isAnyVerilog(event.document.languageId) &&
-          !this.sent.has(event.document.uri.toString()) &&
-          !hasTemplate(event.document.getText())
+          !this.sent.has(event.document.uri.toString())
         ) {
           void this.openDocument(event.document)
         }
         this.publish(event.document.uri)
         this.updateStatus()
-        this.queueDependents(event.document)
+        if (this.active && isAnyVerilog(event.document.languageId)) {
+          ext.index.revision++
+        }
       }),
-      vscode.workspace.onDidSaveTextDocument((doc) => {
-        this.publishAll()
-        this.queueDependents(doc)
-      }),
+      vscode.workspace.onDidSaveTextDocument(() => this.publishAll()),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (this.initialized && event.affectsConfiguration('verilog.server')) {
           clearTimeout(this.restartTimer)
@@ -373,9 +351,6 @@ export class SlangServerComponent extends ExtensionComponent {
             if (this.client === client) {
               this.nativeIncludes = config
               this.resolveIncludes?.()
-              if (this.active) {
-                void this.syncDependents().catch((error) => this.logger.error(String(error)))
-              }
             }
           })
           client.registerFeature({
@@ -466,7 +441,6 @@ export class SlangServerComponent extends ExtensionComponent {
           this.fallbackNeedsIndex = false
           ext.index.releaseGlobalIndex()
           ext.lint.slang.stop()
-          await this.syncDependents()
         } catch (error) {
           if (generation !== this.generation) {
             await this.stop()
@@ -498,9 +472,7 @@ export class SlangServerComponent extends ExtensionComponent {
 
   async stop() {
     this.cancelStart?.()
-    clearTimeout(this.headerChange)
     clearTimeout(this.configChange)
-    this.changedSources.clear()
     this.stopping = true
     const client = this.client
     this.client = undefined
@@ -553,7 +525,6 @@ export class SlangServerComponent extends ExtensionComponent {
         const root = getWorkspaceFolder()
         if (this.active && root !== undefined) {
           await this.writeConfig(root)
-          await this.syncDependents()
           this.publishAll()
         }
       })
@@ -625,80 +596,6 @@ export class SlangServerComponent extends ExtensionComponent {
     }
   }
 
-  private async eligible(doc: vscode.TextDocument): Promise<boolean> {
-    if (doc.uri.scheme !== 'file') {
-      return false
-    }
-    await this.includeReady
-    if (!this.nativeIncludes) {
-      return false
-    }
-    const affected = await this.dependencies.update(
-      [doc.uri.fsPath],
-      this.includeDirectories,
-      new Map(
-        vscode.workspace.textDocuments
-          .filter((d) => d === doc || d.isDirty)
-          .map((d) => [d.uri.fsPath, d.getText()])
-      ),
-      this.includePolicy
-    )
-    const skip = hasTemplate(doc.getText()) || affected.has(doc.uri.fsPath)
-    this.markSkipped(doc.uri, skip)
-    return !skip
-  }
-
-  private queueDependents(doc: vscode.TextDocument) {
-    if (!this.active || !isAnyVerilog(doc.languageId)) {
-      return
-    }
-    ext.index.revision++
-    this.changedSources.add(doc.uri.fsPath)
-    clearTimeout(this.headerChange)
-    this.headerChange = setTimeout(() => {
-      const changed = this.changedSources
-      this.changedSources = new Set()
-      void this.syncDependents(changed).catch((error) => this.logger.error(String(error)))
-    }, 200)
-  }
-
-  private async syncDependents(changed?: Set<string>) {
-    if (!this.active) {
-      return
-    }
-    const client = this.client
-    // A new local header can shadow a previously resolved include without an old reverse edge.
-    const docs = ext.lint.openDocuments()
-    if (docs.length === 0) {
-      return
-    }
-    const skipped = await this.dependencies.update(
-      docs.map((doc) => doc.uri.fsPath),
-      this.includeDirectories,
-      new Map(
-        vscode.workspace.textDocuments
-          .filter((doc) => doc.isDirty || changed?.has(doc.uri.fsPath))
-          .map((doc) => [doc.uri.fsPath, doc.getText()])
-      ),
-      this.includePolicy
-    )
-    if (this.client !== client || !this.active) {
-      return
-    }
-    for (const doc of docs) {
-      const eligible = !skipped.has(doc.uri.fsPath)
-      const uri = doc.uri.toString()
-      this.markSkipped(doc.uri, !eligible)
-      if (!eligible && this.sent.has(uri)) {
-        await this.client?.getFeature('textDocument/didClose').getProvider(doc)?.send(doc)
-        this.markSkipped(doc.uri, true)
-        this.client?.diagnostics?.delete(doc.uri)
-      } else if (eligible && !this.sent.has(uri)) {
-        await this.openDocument(doc)
-      }
-    }
-  }
-
   private async openDocument(doc: vscode.TextDocument) {
     const uri = doc.uri.toString()
     if (this.opening.has(uri)) {
@@ -708,7 +605,6 @@ export class SlangServerComponent extends ExtensionComponent {
     if (!client || !this.active || this.sent.has(uri)) {
       return
     }
-    // didOpen middleware performs the dependency check once.
     const pending = client
       .getFeature('textDocument/didOpen')
       .getProvider(doc)!
@@ -722,7 +618,13 @@ export class SlangServerComponent extends ExtensionComponent {
     return {
       didOpen: async (doc, next) => {
         const client = this.client
-        if ((await this.eligible(doc)) && this.client === client && !this.stopping) {
+        await this.includeReady
+        if (
+          doc.uri.scheme === 'file' &&
+          this.nativeIncludes &&
+          this.client === client &&
+          !this.stopping
+        ) {
           this.sent.add(doc.uri.toString())
           await next(doc)
         }
@@ -730,13 +632,7 @@ export class SlangServerComponent extends ExtensionComponent {
       didChange: async (event, next) => {
         const doc = event.document
         const uri = doc.uri.toString()
-        if (hasTemplate(doc.getText())) {
-          if (this.sent.has(uri)) {
-            await this.client?.getFeature('textDocument/didClose').getProvider(doc)?.send(doc)
-          }
-          this.markSkipped(doc.uri, true)
-          this.client?.diagnostics?.delete(doc.uri)
-        } else if (this.sent.has(uri)) {
+        if (this.sent.has(uri)) {
           await next(event)
         } else {
           await this.openDocument(doc)
@@ -751,16 +647,9 @@ export class SlangServerComponent extends ExtensionComponent {
         this.rawDiagnostics.delete(doc.uri.toString())
         this.manualVersions.delete(doc.uri.toString())
         ext.inactiveRegions.clearNative(doc.uri.toString())
-        this.skipped.delete(doc.uri.toString())
       },
       didSave: async (doc, next) => {
-        if (!(await this.eligible(doc))) {
-          if (this.sent.has(doc.uri.toString())) {
-            await this.client?.getFeature('textDocument/didClose').getProvider(doc)?.send(doc)
-          }
-          this.markSkipped(doc.uri, true)
-          this.client?.diagnostics?.delete(doc.uri)
-        } else if (this.sent.has(doc.uri.toString())) {
+        if (this.sent.has(doc.uri.toString())) {
           await next(doc)
         } else {
           await this.openDocument(doc)
@@ -849,7 +738,6 @@ export class SlangServerComponent extends ExtensionComponent {
     const allowed =
       doc &&
       this.sent.has(uri.toString()) &&
-      !this.isSkipped(doc) &&
       this.diagnosticVersions.get(uri.toString()) === doc.version &&
       lint.enabled.getValue() &&
       (this.manualVersions.get(uri.toString()) === doc.version ||
@@ -895,7 +783,6 @@ export class SlangServerComponent extends ExtensionComponent {
       return
     }
     const doc = vscode.window.activeTextEditor?.document
-    const template = doc && isAnyVerilog(doc.languageId) && this.isSkipped(doc)
     const unversioned =
       doc &&
       this.rawDiagnostics.has(doc.uri.toString()) &&
@@ -910,20 +797,16 @@ export class SlangServerComponent extends ExtensionComponent {
     this.status.severity = unversioned
       ? vscode.LanguageStatusSeverity.Warning
       : vscode.LanguageStatusSeverity.Information
-    this.status.text = template
-      ? 'Verilog: template browsing'
-      : `Verilog: ${this.active ? (waiting ? 'checking current version' : 'slang-server') : this.state === 'external' ? 'external slang client' : this.pending ? this.state : 'ctags / slang CLI'}`
-    this.status.detail = template
-      ? 'Unexpanded Perl template or included template: semantic checks skipped; static declarations only.'
-      : this.active
-        ? unversioned
-          ? 'This server does not supply diagnostic versions. Problems are hidden because freshness cannot be checked; use the bundled server or Show Raw Diagnostics.'
-          : waiting
-            ? `Waiting for diagnostics for document version ${doc!.version}.`
-            : 'Native shallow analysis; diagnostics match current open .sv/.v versions. Show Raw Diagnostics includes results hidden by reading mode.'
-        : this.state === 'external'
-          ? 'Built-in server and CLI lint disabled while the external slang extension is installed.'
-          : (ext.lint.slang.statusMessage ??
-            `Server ${this.state}. Configure verilog.server.path to enable it.`)
+    this.status.text = `Verilog: ${this.active ? (waiting ? 'checking current version' : 'slang-server') : this.state === 'external' ? 'external slang client' : this.pending ? this.state : 'ctags / slang CLI'}`
+    this.status.detail = this.active
+      ? unversioned
+        ? 'This server does not supply diagnostic versions. Problems are hidden because freshness cannot be checked; use the bundled server or Show Raw Diagnostics.'
+        : waiting
+          ? `Waiting for diagnostics for document version ${doc!.version}.`
+          : 'Native shallow analysis; diagnostics match current open .sv/.v versions. Show Raw Diagnostics includes results hidden by reading mode.'
+      : this.state === 'external'
+        ? 'Built-in server and CLI lint disabled while the external slang extension is installed.'
+        : (ext.lint.slang.statusMessage ??
+          `Server ${this.state}. Configure verilog.server.path to enable it.`)
   }
 }

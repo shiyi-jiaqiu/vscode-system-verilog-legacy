@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.6.2] - 2026-10-26
+
+- Remove Perl/template highlighting, masking, static-only routing, and lint/formatting exclusions from the client and native patch. All HDL files now follow the ordinary tool paths; rebuild both components.
+
 ## [0.6.1] - 2026-10-26
 
 - Repair follow-up findings N1–N17: bound scope pairing and native metadata work, target diagnostic/include invalidation, load CLI coordinate data lazily, preserve enum/import/macro discovery, and make startup deadlines configurable. See [cross-validation](native/tests/review2.md).

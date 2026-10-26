@@ -269,7 +269,6 @@ export class InactiveRegionsComponent extends ExtensionComponent {
     if (
       ext.server.active ||
       ext.server.pending ||
-      ext.server.isSkipped(editor.document) ||
       filelist === undefined ||
       !isAnyVerilog(editor.document.languageId)
     ) {

@@ -3,7 +3,6 @@ import * as vscode from 'vscode'
 import { ext } from '../extension'
 import { resolveInclude } from '../Filelist'
 import { ExtensionComponent, PathConfigObject } from '../lib/libconfig'
-import { maskTemplate } from '../Template'
 import { anyVerilogSelector, getParentText, getPrev2Char, getPrevChar } from '../utils'
 import builtins from './builtins.json'
 import { getConstValue, getMacroBody, ValueStep } from './ConstValue'
@@ -397,17 +396,6 @@ export class CtagsServerComponent
 
     this.logger.info('Hover requested')
 
-    const offset = document.offsetAt(position)
-    const dynamic = maskTemplate(document.getText()).regions.find(
-      ([start, end]) => start <= offset && offset < end
-    )
-    if (dynamic) {
-      return new vscode.Hover(
-        'Unexpanded Perl template: generated names and values cannot be resolved. Static declarations remain available.',
-        new vscode.Range(document.positionAt(dynamic[0]), document.positionAt(dynamic[1]))
-      )
-    }
-
     // TODO: reuse this range, pass to findSymbol
     let range = document.getWordRangeAtPosition(position)
     if (range === undefined) {
@@ -631,8 +619,7 @@ export class CtagsServerComponent
     const unit = macro
       ? undefined
       : vdoc.topSymbols.find((sym) => sym.isValid && sym.getFullRange().contains(position))
-    // Perl template markup is not Verilog
-    const text = maskTemplate(document.getText()).text
+    const text = document.getText()
     const end = unit === undefined ? text.length : document.offsetAt(unit.getFullRange().end)
 
     const highlights: vscode.DocumentHighlight[] = []

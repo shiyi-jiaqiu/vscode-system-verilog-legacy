@@ -37,7 +37,7 @@ For debugging, `VERILOG_TEST_GREP` selects Mocha tests,
 retains native fixtures, stderr and both directions of public LSP traffic. Native
 requests have timeouts and each server child has a 2 GiB address-space cap. The
 protocol watcher cases explicitly send `workspace/didChangeWatchedFiles`; they
-verify event processing, not an OS watcher. The client template-shadow case uses
+verify event processing, not an OS watcher. The client include-shadow case uses
 actual editor saves without saving its includer.
 
 ## Finding coverage
@@ -46,7 +46,7 @@ actual editor saves without saving its includer.
 | --- | --- | --- |
 | F01 | Merge live open-buffer reference metadata into query candidates | Native references and rename from both ends; apply/save edits and requery |
 | F02 | Invalidate SourceManager lookup and dependent syntax on disk topology changes; retain editor-owned buffers | Native `.svh`, `.sv`, `.v` delete/create, atomic replace, rename, dirty header ownership |
-| F03 | Reject template trees in metadata/dependency loads; route with effective native includes; rescan open dependency graphs on topology changes | Native unopened template exclusion/recovery; client native-only `-I`, local shadow creation/save and marker removal |
+| F03 | Use ordinary HDL analysis for all sources; retain effective native includes | Native markup in comments preserves metadata/hover, unexpanded markup produces syntax errors; client native-only `-I` and local shadow save |
 | F04 | Manual current-version result bypasses the save-only display gate | Client dirty manual Lint with both run-on-save values and further edits |
 | F05 | Request byte columns and translate saved input snapshots to UTF-16 | Real syntax/local/full CLI after Chinese, emoji, tab and combining text; real notes and synthetic multiline ranges; compiler-discovered libraries/includes |
 | F06 | Metadata uses effective preprocessor options and reparses dependents | Native flags, nested filelists, header macros, and headers outside index roots |
@@ -55,7 +55,7 @@ actual editor saves without saving its includer.
 | F09 | Preserve package qualification and nearest lexical/import scope; avoid arbitrary constant candidates | Client same/separate-file packages, imports, completion, ambiguous imports, function and named-block shadows |
 | F10 | Textual macro substitution and SV exponent precedence/associativity; conservative sizing limits | Client values 7/4/64 and rejected width-sensitive expressions |
 | F11 | Resolve macros and header symbols through the requesting source's include closure | Client local/`-I` priority, nontraditional header extensions and dirty header updates |
-| F12 | Use a filtered placeholder for dynamic template declarators | Client outline excludes fragments, `int` and placeholders while retaining static siblings |
+| F12 | Removed with template masking | The former filtered-outline test no longer applies |
 | F13 | Convert native hover-link columns through the UTF-16 helper | Native Unicode link target |
 | F14 | Return declaration ranges with workspace symbols | Native second module has its actual line/range |
 | F15 | Cancel startup before lifecycle queueing, bound initialization, terminate child and settle client startup | Client never-replying server: disable, timeout, PID exit, no unhandled rejection, then real native startup |

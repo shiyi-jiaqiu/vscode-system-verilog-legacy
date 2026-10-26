@@ -33,7 +33,7 @@
 
 - `verilog.server.enabled`: boolean = true
 
-    Use slang-server for standard Verilog navigation and diagnostics when available. Falls back to ctags and slang CLI if unavailable. Perl templates use static browsing only.
+    Use slang-server for standard Verilog navigation and diagnostics when available. Falls back to ctags and slang CLI if unavailable.
 
 
 - `verilog.server.path`: string = ""
