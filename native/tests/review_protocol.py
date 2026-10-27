@@ -150,6 +150,80 @@ class ReviewTests(unittest.TestCase):
     def names(self):
         return {entry['name'] for entry in self.server.request('workspace/symbol', {'query': ''})}
 
+    def test_SV_standalone_class_members_resolve_without_the_base_class(self):
+        self.config()
+        declaration = ('class uvm_pcie7_sh1 extends uvm_pcie7_comom_tools;\n'
+                       '  int own_id;\n'
+                       '  function int get_id(); return own_id; endfunction\n'
+                       '  static function uvm_pcie7_sh1 body(); return null; endfunction\n'
+                       'endclass\n')
+        self.write('seq/uvm_pcie_sh1.sv', declaration)
+        self.write('seq/hidden_pkg.sv', 'package hidden_pkg;\n'
+                   'class uvm_pcie7_sh1; int own_id; endclass\n'
+                   'class hidden_only; endclass\nendpackage\n')
+        reference = ('module top;\n  uvm_pcie7_sh1 obj;\n  initial begin\n'
+                     '    $display(obj.own_id);\n'
+                     '    $display(obj.get_id());\n'
+                     '    $display(uvm_pcie7_sh1::body().get_id());\n'
+                     '  end\nendmodule\n')
+        file = 'test/test_uvm_pcie7_sh1.sv'
+        self.write(file, reference)
+        s = self.start()
+        self.assertIn('uvm_pcie7_sh1', self.names())
+        s.open(file)
+        self.assertTrue(any('uvm_pcie7_sh1' in d['message'] and d['severity'] == 1
+                            for d in s.diags[s.uri(file)]['diagnostics']))
+        for anchor, prefix, line, column in [
+                ('uvm_pcie7_sh1 obj', '', 0, 6), ('obj.own_id', 'obj.', 1, 6),
+                ('obj.get_id', 'obj.', 2, 15), ('uvm_pcie7_sh1::body', '', 0, 6),
+                ('::body()', '::', 3, 32), ('body().get_id', 'body().', 2, 15)]:
+            offset = reference.index(anchor) + len(prefix)
+            query = s.at(file, reference[:offset].count('\n'),
+                         offset - reference.rfind('\n', 0, offset) - 1)
+            definitions = s.request('textDocument/definition', query)
+            self.assertEqual(len(definitions), 1, (anchor, definitions))
+            self.assertEqual(definitions[0]['uri'], s.uri('seq/uvm_pcie_sh1.sv'))
+            self.assertEqual(definitions[0]['range']['start'], {'line': line, 'character': column})
+            self.assertTrue(s.request('textDocument/hover', query), anchor)
+        completions = s.request('textDocument/completion', s.at(file, 3, 17))
+        self.assertIn('own_id', {item['label'] for item in completions})
+        self.write('test/imported.sv', 'module imported; import hidden_pkg::*; '
+                   'uvm_pcie7_sh1 obj; initial $display(obj.own_id); endmodule\n')
+        s.open('test/imported.sv')
+        text = (self.root / 'test/imported.sv').read_text()
+        definitions = s.request('textDocument/definition', s.at('test/imported.sv', 0, text.index('own_id')))
+        self.assertEqual(len(definitions), 1)
+        self.assertEqual(definitions[0]['uri'], s.uri('seq/hidden_pkg.sv'))
+        self.write('test/local.sv', 'module local_scope;\n'
+                   'class uvm_pcie7_sh1; int own_id; endclass\n'
+                   'uvm_pcie7_sh1 obj; initial $display(obj.own_id); endmodule\n')
+        s.open('test/local.sv')
+        definitions = s.request('textDocument/definition', s.at('test/local.sv', 2, 40))
+        self.assertEqual(len(definitions), 1)
+        self.assertEqual(definitions[0]['uri'], s.uri('test/local.sv'))
+        self.assertEqual(definitions[0]['range']['start']['line'], 1)
+        self.write('test/hidden.sv', 'module hidden; hidden_only obj; endmodule\n')
+        s.open('test/hidden.sv')
+        self.assertEqual(s.request('textDocument/definition', s.at('test/hidden.sv', 0, 15)), [])
+        s.open('seq/uvm_pcie_sh1.sv')
+        self.assertEqual(s.request('textDocument/definition', s.at('seq/uvm_pcie_sh1.sv', 0, 28)), [])
+        s.change('seq/uvm_pcie_sh1.sv', declaration.replace('own_id', 'changed'))
+        self.assertEqual(s.request('textDocument/definition', s.at(file, 3, 17)), [])
+        s.change('seq/uvm_pcie_sh1.sv', declaration, 3)
+        self.assertTrue(s.request('textDocument/definition', s.at(file, 3, 17)))
+        self.write('test/inherited.sv', 'module inherited;\nuvm_pcie7_sh1 obj;\n'
+                   'initial $display(obj.inherited_id()); endmodule\n')
+        s.open('test/inherited.sv')
+        inherited = s.at('test/inherited.sv', 2, 21)
+        self.assertEqual(s.request('textDocument/definition', inherited), [])
+        self.write('seq/base.sv', 'class uvm_pcie7_comom_tools;\n'
+                   '  function int inherited_id(); return 9; endfunction\nendclass\n')
+        s.watched(('seq/base.sv', 1))
+        definitions = s.request('textDocument/definition', inherited)
+        self.assertEqual(len(definitions), 1)
+        self.assertEqual(definitions[0]['uri'], s.uri('seq/base.sv'))
+        self.assertEqual(definitions[0]['range']['start'], {'line': 1, 'character': 15})
+
     def test_SV_repeated_type_queries_keep_memory_bounded(self):
         fields = '\n'.join(f'logic [63:0] data_{i};' for i in range(500))
         params = ', '.join(f'input int arg{i}' for i in range(60))

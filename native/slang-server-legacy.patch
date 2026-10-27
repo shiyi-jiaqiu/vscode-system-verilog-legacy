@@ -15,7 +15,7 @@ index d8ccf70..d32b079 100644
      rfl::Description<"Include directories, relative to the workspace root. Searched after "
                       "directories supplied through flags and build files. Supports $VAR, "
 diff --git a/include/Indexer.h b/include/Indexer.h
-index 88bd7a2..3160721 100644
+index 88bd7a2..bd8467f 100644
 --- a/include/Indexer.h
 +++ b/include/Indexer.h
 @@ -22,6 +22,7 @@
@@ -38,7 +38,18 @@ index 88bd7a2..3160721 100644
      //////////////////////////////////////////
      // Updating interface
      //////////////////////////////////////////
-@@ -134,6 +140,7 @@ struct Indexer {
+@@ -125,6 +131,10 @@ struct Indexer {
+     /// Find headers that declare a name at their outermost scope.
+     std::vector<std::filesystem::path> getHeadersForSymbol(std::string_view name) const;
+ 
++    /// Retain every outer-scope header declaration tied at the nearest directory distance.
++    std::vector<std::filesystem::path> getNearestHeadersForSymbol(
++        std::string_view name, const std::filesystem::path& source) const;
++
+     /// Check gathered filenames and parsed relationships without resolving paths.
+     bool hasPotentialIncluders(const std::filesystem::path& canonicalPath) const;
+ 
+@@ -134,6 +144,7 @@ struct Indexer {
      struct GlobalSymbolLoc {
          const std::filesystem::path* uri;
          slang::syntax::SyntaxKind kind;
@@ -46,7 +57,7 @@ index 88bd7a2..3160721 100644
      };
      /// Find the nearest indexed declaration by directory distance, breaking ties by canonical path.
      std::optional<GlobalSymbolLoc> getNearestSymbolLoc(std::string_view name,
-@@ -152,7 +159,7 @@ struct Indexer {
+@@ -152,7 +163,7 @@ struct Indexer {
  
      // Iterate over all symbols (for workspace symbols)
      template<std::invocable<const std::string&, const Indexer::GlobalSymbolLoc&> Callback>
@@ -55,7 +66,7 @@ index 88bd7a2..3160721 100644
  
  private:
      friend struct IndexWriteGuard;
-@@ -162,17 +169,22 @@ private:
+@@ -162,17 +173,22 @@ private:
      struct GlobalSymbol {
          std::string name;
          slang::syntax::SyntaxKind kind;
@@ -78,7 +89,7 @@ index 88bd7a2..3160721 100644
      };
  
      // Index storage
-@@ -190,6 +202,8 @@ private:
+@@ -190,6 +206,8 @@ private:
      /// Files containing each include filename, gathered without resolving include paths.
      std::unordered_map<std::string, slang::SmallVector<const std::filesystem::path*, 2>>
          includeReferences_;
@@ -87,7 +98,7 @@ index 88bd7a2..3160721 100644
  
      /// Reverse relationships from parsed buffers, keyed by canonical paths.
      std::unordered_map<std::filesystem::path, std::vector<std::filesystem::path>> includers_;
-@@ -265,6 +279,18 @@ private:
+@@ -265,6 +283,18 @@ private:
  
      // Threading - uses reader-writer lock pattern
      uint32_t numThreads_ = 0;
@@ -106,7 +117,7 @@ index 88bd7a2..3160721 100644
      mutable std::shared_mutex indexMutex_;
      mutable std::condition_variable_any indexingCondition_;
      bool indexingInProgress_ = false;
-@@ -309,11 +335,18 @@ struct IndexReadGuard {
+@@ -309,11 +339,18 @@ struct IndexReadGuard {
  
  // Implementation of forEachSymbol template (needs IndexReadGuard definition)
  template<std::invocable<const std::string&, const Indexer::GlobalSymbolLoc&> Callback>
@@ -277,6 +288,19 @@ index 13859d9..09d7656 100644
  
      /// Load the configuration from a given config object, reindex if needed or forced
      /// Returns false when an automatic reload cannot construct a valid replacement.
+diff --git a/include/ast/ShallowCompilation.h b/include/ast/ShallowCompilation.h
+index e792dae..216e98d 100644
+--- a/include/ast/ShallowCompilation.h
++++ b/include/ast/ShallowCompilation.h
+@@ -33,7 +33,7 @@ public:
+     ShallowCompilation(slang::SourceManager& sourceManager,
+                        std::shared_ptr<slang::syntax::SyntaxTree> tree, const slang::Bag& options,
+                        const std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>& dependencies,
+-                       const ServerCompilation* design);
++                       const ServerCompilation* design, bool inferClassContext);
+ 
+     /// Source manager supplying the buffers used by this compilation.
+     slang::SourceManager& getSourceManager() const { return m_sourceManager; }
 diff --git a/include/document/ShallowAnalysis.h b/include/document/ShallowAnalysis.h
 index b76c0ab..68a0914 100644
 --- a/include/document/ShallowAnalysis.h
@@ -293,10 +317,18 @@ index b76c0ab..68a0914 100644
  
      const slang::ast::Symbol* getAssignmentPatternTargetSymbol(
 diff --git a/include/document/SlangDoc.h b/include/document/SlangDoc.h
-index 999340e..3f5c822 100644
+index 999340e..d60b16f 100644
 --- a/include/document/SlangDoc.h
 +++ b/include/document/SlangDoc.h
-@@ -76,6 +76,9 @@ private:
+@@ -60,6 +60,7 @@ private:
+     /// Document analysis for syntax and symbol analysis.
+     /// Shared so that callers can hold the analysis alive even if getAnalysis() recreates it.
+     std::shared_ptr<ShallowAnalysis> m_analysis;
++    std::shared_ptr<ShallowAnalysis> m_navigationAnalysis;
+ 
+     /// Compilation shared with the includer, used to detect context replacement.
+     std::shared_ptr<ShallowCompilation> m_includeCompilation;
+@@ -76,6 +77,9 @@ private:
      std::shared_ptr<ShallowAnalysis> refreshAnalysis(const lsp::RequestContext& ctx);
  
  public:
@@ -306,7 +338,15 @@ index 999340e..3f5c822 100644
      SlangDoc(ServerDriver& driver, URI uri, slang::SourceBuffer buffer);
  
      /// Macro-definition-only files use standalone analysis without include-context selection.
-@@ -116,6 +119,12 @@ public:
+@@ -111,11 +115,20 @@ public:
+     /// Returns a shared_ptr so callers can hold the analysis alive independently of this document.
+     std::shared_ptr<ShallowAnalysis> getAnalysis(const lsp::RequestContext& ctx = {});
+ 
++    /// Recover indexed standalone class context for editor queries while retaining diagnostics.
++    std::shared_ptr<ShallowAnalysis> getNavigationAnalysis(const lsp::RequestContext& ctx = {});
++
+     /// @brief Drop the cached analysis so the next getAnalysis() rebuilds it.
+     /// Used when an external change (e.g. active-instance selection) means cached
      /// goto/hover results must be recomputed.
      void invalidateAnalysis() { m_analysis.reset(); }
  
@@ -385,7 +425,7 @@ index 0000000..636c038
 +}
 +} // namespace server
 diff --git a/src/Indexer.cpp b/src/Indexer.cpp
-index 88c35cd..1f18cf6 100644
+index 88c35cd..ba3560a 100644
 --- a/src/Indexer.cpp
 +++ b/src/Indexer.cpp
 @@ -11,6 +11,11 @@
@@ -786,7 +826,28 @@ index 88c35cd..1f18cf6 100644
      for (const auto& spelling : entry.includes) {
          auto references = includeReferences_.find(fs::path(spelling).filename().string());
          if (references == includeReferences_.end())
-@@ -999,6 +1242,33 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
+@@ -890,6 +1133,20 @@ std::vector<fs::path> Indexer::getHeadersForSymbol(std::string_view name) const
+     return result;
+ }
+ 
++std::vector<fs::path> Indexer::getNearestHeadersForSymbol(std::string_view name,
++                                                       const fs::path& source) const {
++    IndexReadGuard guard(*this);
++    auto it = headerSymbolToFiles_.find(std::string(name));
++    if (it == headerSymbolToFiles_.end())
++        return {};
++    auto nearest = nearestFiles<const fs::path*>(
++        source, it->second, [](const fs::path* path) { return path; });
++    std::vector<fs::path> result;
++    for (auto* path : nearest)
++        result.push_back(**path);
++    return result;
++}
++
+ std::vector<fs::path> Indexer::getFilesForInclude(std::string_view path) const {
+     auto includePath = fs::path(path).lexically_normal();
+     if (includePath.empty() || includePath.is_absolute())
+@@ -999,6 +1256,33 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
  
      for (const auto& change : params.changes) {
          fs::path path = change.uri.getPath();
@@ -820,7 +881,7 @@ index 88c35cd..1f18cf6 100644
  
          switch (change.type) {
              case lsp::FileChangeType::Created: {
-@@ -1025,6 +1295,9 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
+@@ -1025,6 +1309,9 @@ void Indexer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesP
  
      // Parse all new/changed files potentially in thread pool
      if (!pathsToAdd.empty()) {
@@ -830,7 +891,7 @@ index 88c35cd..1f18cf6 100644
          auto indexedPaths = indexPaths(pathsToAdd);
          for (size_t i = 0; i < indexedPaths.size(); ++i)
              indexPath(pathsToAdd[i], indexedPaths[i]);
-@@ -1046,9 +1319,7 @@ void Indexer::collectFilesFromDirectory(const fs::path& dir,
+@@ -1046,9 +1333,7 @@ void Indexer::collectFilesFromDirectory(const fs::path& dir,
          return paths.contains(normalized);
      };
  
@@ -841,7 +902,7 @@ index 88c35cd..1f18cf6 100644
          (!paths.empty() && paths.containsDirectoryOrAncestor(
                                 (fs::absolute(dir).lexically_normal() / "").generic_string())) ||
          !fs::exists(dir) || !fs::is_directory(dir)) {
-@@ -1130,10 +1401,15 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
+@@ -1130,10 +1415,15 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
                              const std::map<std::string, std::string>& env) {
      std::vector<fs::path> pathsToIndex;
      DirectoryEntryCounts directoryEntries;
@@ -858,7 +919,7 @@ index 88c35cd..1f18cf6 100644
      for (const auto& cfg : indexConfigs) {
          std::vector<std::string> excludedNames;
          std::vector<std::string> excludedPaths;
-@@ -1174,6 +1450,7 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
+@@ -1174,6 +1464,7 @@ void Indexer::startIndexing(const std::vector<Config::IndexConfig>& indexConfigs
              else {
                  continue;
              }
@@ -866,7 +927,7 @@ index 88c35cd..1f18cf6 100644
              collectFilesFromDirectory(fullDirPath.lexically_normal(), excludedNames, pathsToIndex,
                                        counts, excludedPaths);
          }
-@@ -1187,6 +1464,15 @@ void Indexer::startIndexing(const std::vector<std::string>& globs,
+@@ -1187,6 +1478,15 @@ void Indexer::startIndexing(const std::vector<std::string>& globs,
                              bool inferIncludeDirectories,
                              const std::map<std::string, std::string>& env) {
      std::vector<fs::path> pathsToIndex;
@@ -882,7 +943,7 @@ index 88c35cd..1f18cf6 100644
      for (const auto& pattern : globs) {
          ScopedTimer t_glob("Globbing " + pattern);
          size_t beginCount = pathsToIndex.size();
-@@ -1277,7 +1563,13 @@ void Indexer::indexAndReport(std::vector<fs::path> pathsToIndex, bool inferInclu
+@@ -1277,7 +1577,13 @@ void Indexer::indexAndReport(std::vector<fs::path> pathsToIndex, bool inferInclu
      IndexWriteGuard guard(*this);
      ScopedTimer t_index("Workspace indexing");
      directoryEntryCounts_ = std::move(directoryEntries);
@@ -951,7 +1012,7 @@ index 2685327..489f034 100644
      }
      m_dirtyUris.clear();
 diff --git a/src/ServerDriver.cpp b/src/ServerDriver.cpp
-index 5cd6d93..4956abd 100644
+index 5cd6d93..754d39c 100644
 --- a/src/ServerDriver.cpp
 +++ b/src/ServerDriver.cpp
 @@ -21,6 +21,9 @@
@@ -964,7 +1025,40 @@ index 5cd6d93..4956abd 100644
  #include <algorithm>
  #include <filesystem>
  #include <memory>
-@@ -165,6 +168,7 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
+@@ -44,12 +47,32 @@
+ #include "slang/parsing/ParserMetadata.h"
+ #include "slang/syntax/AllSyntax.h"
+ #include "slang/syntax/SyntaxTree.h"
++#include "slang/syntax/SyntaxVisitor.h"
+ #include "slang/text/SourceLocation.h"
+ #include "slang/text/SourceManager.h"
++#include "slang/util/Function.h"
+ 
+ namespace server {
+ using namespace slang;
+ 
++static void visitClassTypeNames(const syntax::SyntaxNode& root,
++                                function_ref<void(parsing::Token)> callback) {
++    auto visitor = syntax::makeSyntaxVisitor([&](auto& visitor, const syntax::SyntaxNode& node) {
++        const syntax::NameSyntax* name = nullptr;
++        if (auto* type = node.as_if<syntax::NamedTypeSyntax>())
++            name = type->name;
++        else if (auto* base = node.as_if<syntax::ExtendsClauseSyntax>())
++            name = base->baseName;
++        else if (auto* type = node.as_if<syntax::ClassNameSyntax>())
++            name = type;
++        if (name && (name->kind == syntax::SyntaxKind::IdentifierName ||
++                     name->kind == syntax::SyntaxKind::ClassName))
++            callback(name->getFirstToken());
++        visitor.visitDefault(node);
++    });
++    root.visit(visitor);
++}
++
+ #ifdef SLANG_SERVER_DEBUG
+ bool ServerDriver::s_debugHoversEnabled = true;
+ #endif
+@@ -165,6 +188,7 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
      // Configure diagnostic engine. The LSP server reports warnings as editor
      // diagnostics by default; user-provided -Wno-* mappings still suppress
      // specific warnings via the severity table populated by processOptions().
@@ -972,7 +1066,7 @@ index 5cd6d93..4956abd 100644
      diagEngine.setIgnoreAllWarnings(false);
      diagEngine.setIgnoreAllNotes(false);
  
-@@ -200,11 +204,28 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
+@@ -200,11 +224,28 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
      return ok;
  }
  
@@ -1001,7 +1095,7 @@ index 5cd6d93..4956abd 100644
  
      // Pragma mappings are populated from the preprocessor/lexer
      doc.getSyntaxTree();
-@@ -220,6 +241,7 @@ void ServerDriver::analyzeDocument(SlangDoc& doc, const lsp::RequestContext& ctx
+@@ -220,6 +261,7 @@ void ServerDriver::analyzeDocument(SlangDoc& doc, const lsp::RequestContext& ctx
  }
  
  void ServerDriver::onDocDidSave(SlangDoc& doc) {
@@ -1009,7 +1103,7 @@ index 5cd6d93..4956abd 100644
      auto tree = doc.getSyntaxTree();
      if (sm.getFullPath(tree->getSourceBufferIds()[0]) != sm.getFullPath(doc.getBuffer())) {
          auto indexOptions = options;
-@@ -244,7 +266,20 @@ void ServerDriver::onDocDidSave(SlangDoc& doc) {
+@@ -244,7 +286,20 @@ void ServerDriver::onDocDidSave(SlangDoc& doc) {
                  ERROR("Open Doc {} not found", uri.getPath());
                  continue;
              }
@@ -1031,7 +1125,7 @@ index 5cd6d93..4956abd 100644
                  continue;
  
              analyzeDocument(*it->second);
-@@ -262,6 +297,7 @@ void ServerDriver::onDocDidSave(SlangDoc& doc) {
+@@ -262,6 +317,7 @@ void ServerDriver::onDocDidSave(SlangDoc& doc) {
  void ServerDriver::publishCompilationDiagnostics(const URI* priorityUri) {
      diagEngine.setMappingsFromPragmas();
      for (const auto& entry : docs) {
@@ -1039,7 +1133,7 @@ index 5cd6d93..4956abd 100644
          entry.second->issueParseDiagnostics(diagEngine);
      }
      comp->issueDiagnosticsTo(diagEngine);
-@@ -288,7 +324,7 @@ void ServerDriver::copyOpenDocumentsFrom(const ServerDriver* oldDriver) {
+@@ -288,7 +344,7 @@ void ServerDriver::copyOpenDocumentsFrom(const ServerDriver* oldDriver) {
          // openDocument expects no \0
          auto text = docIt->second->getText();
          text.remove_suffix(1);
@@ -1048,7 +1142,7 @@ index 5cd6d93..4956abd 100644
      }
  }
  
-@@ -336,13 +372,17 @@ std::unique_ptr<ServerDriver> ServerDriver::createFromFileLists(
+@@ -336,13 +392,17 @@ std::unique_ptr<ServerDriver> ServerDriver::createFromFileLists(
      return newDriver;
  }
  
@@ -1067,7 +1161,7 @@ index 5cd6d93..4956abd 100644
      }
      else if (docIter == docs.end() && m_buildSourceUris.contains(uri)) {
          doc = SlangDoc::open(*this, uri);
-@@ -362,7 +402,10 @@ void ServerDriver::openDocument(const URI& uri, const std::string_view text) {
+@@ -362,7 +422,10 @@ void ServerDriver::openDocument(const URI& uri, const std::string_view text) {
          docs[uri] = doc;
      }
  
@@ -1078,7 +1172,7 @@ index 5cd6d93..4956abd 100644
          // File is already part of the compilation — compilation diags were
          // already published, so skip shallow diags. Still publish inactive regions.
          publishInactiveRegions(*doc);
-@@ -400,6 +443,7 @@ void ServerDriver::onDocDidChange(const lsp::DidChangeTextDocumentParams& params
+@@ -400,6 +463,7 @@ void ServerDriver::onDocDidChange(const lsp::DidChangeTextDocumentParams& params
      }
  
      doc->onChange(params.contentChanges);
@@ -1086,12 +1180,25 @@ index 5cd6d93..4956abd 100644
      if (ctx.isCancelled()) {
          ctx.info("Applied changes for {}; skipping superseded analysis", doc->getWsRelativePath());
          ctx.throwIfCancelled("before analysis");
-@@ -442,57 +486,62 @@ void ServerDriver::reloadDocument(const URI& uri) {
+@@ -442,57 +506,91 @@ void ServerDriver::reloadDocument(const URI& uri) {
  
  void ServerDriver::onWorkspaceDidChangeWatchedFiles(
      const lsp::DidChangeWatchedFilesParams& params) {
 -    // Collect docs that need updating after all buffers are reloaded
 +    std::unordered_set<URI> topologyAffected;
++    std::unordered_set<std::filesystem::path> changedPaths;
++    for (const auto& change : params.changes) {
++        if (change.type != lsp::FileChangeType::Deleted && !isDocumentOpen(change.uri))
++            changedPaths.insert(std::filesystem::weakly_canonical(change.uri.getPath()));
++    }
++    std::unordered_set<std::string> changedClasses;
++    if (!changedPaths.empty()) {
++        m_indexer.forEachSymbol(true, [&](const std::string& name, const auto& entry) {
++            if (entry.kind == syntax::SyntaxKind::ClassDeclaration &&
++                changedPaths.contains(std::filesystem::weakly_canonical(*entry.uri)))
++                changedClasses.insert(name);
++        });
++    }
 +    const auto pp = options.getOrDefault<slang::parsing::PreprocessorOptions>();
 +    const auto userDirs = sm.getIncludeDirectories();
 +    const auto systemDirs = sm.getIncludeDirectories(true);
@@ -1099,6 +1206,22 @@ index 5cd6d93..4956abd 100644
 +        auto it = docs.find(uri);
 +        if (it == docs.end()) continue;
 +        auto tree = it->second->getSyntaxTree();
++        if (!changedClasses.empty() && it->second->hasAnalysis()) {
++            for (const auto& dependency :
++                 it->second->getAnalysis()->getCompilation()->getSyntaxTrees()) {
++                visitClassTypeNames(dependency->root(), [&](parsing::Token token) {
++                    if (!changedClasses.contains(std::string(token.valueText())))
++                        return;
++                    const auto source =
++                        sm.getFullPath(sm.getFullyExpandedLoc(token.location()).buffer());
++                    for (const auto& header :
++                         m_indexer.getNearestHeadersForSymbol(token.valueText(), source)) {
++                        if (changedPaths.contains(std::filesystem::weakly_canonical(header)))
++                            topologyAffected.insert(uri);
++                    }
++                });
++            }
++        }
 +        for (const auto& include : tree->getIncludeDirectives()) {
 +            const auto from = sm.getFullyExpandedLoc(include.syntax->sourceRange().start());
 +            auto candidates = includeCandidates(sm.getFullPath(from.buffer()), include.path,
@@ -1190,7 +1313,92 @@ index 5cd6d93..4956abd 100644
  }
  
  void ServerDriver::invalidateAnalysesAndRefreshClient() {
-@@ -1334,6 +1383,7 @@ std::optional<std::vector<lsp::DocumentHighlight>> ServerDriver::getDocDocumentH
+@@ -709,16 +807,41 @@ std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees
+ 
+             const auto& source = sm.getFullPath(sm.getFullyExpandedLoc(token.location()).buffer());
+             auto symbolLoc = m_indexer.getNearestSymbolLoc(name, source);
+-            if (!symbolLoc)
++            std::optional<std::filesystem::path> path;
++            bool classDependency = false;
++            if (symbolLoc) {
++                path = *symbolLoc->uri;
++            }
++            else if (!fullHierarchy) {
++                auto headers = m_indexer.getNearestHeadersForSymbol(name, source);
++                if (headers.size() != 1)
++                    return;
++                path = headers.front();
++                classDependency = true;
++            }
++            if (!path)
++                return;
++            std::error_code ec;
++            if (classDependency && !isDocumentOpen(URI::fromFile(*path)) &&
++                !std::filesystem::is_regular_file(*path, ec))
+                 return;
+             knownNames.emplace(name);
+             // An included file may declare this name only under different preprocessor flags.
+             // Reloading it would discard that context and can re-enter this compilation's analysis.
+-            if (processedFiles.contains(std::filesystem::weakly_canonical(*symbolLoc->uri)))
++            if (processedFiles.contains(std::filesystem::weakly_canonical(*path)))
+                 return;
+-            auto newdoc = getDocument(URI::fromFile(*symbolLoc->uri));
++            auto newdoc = getDocument(URI::fromFile(*path));
+             if (newdoc) {
+                 auto dependencyTree = newdoc->getSyntaxTree();
++                if (classDependency &&
++                    std::ranges::none_of(dependencyTree->getMetadata().classDecls,
++                                         [&](const auto* declaration) {
++                                             return declaration->name.valueText() == name &&
++                                                    (!declaration->parent ||
++                                                     declaration->parent->kind ==
++                                                         syntax::SyntaxKind::CompilationUnit);
++                                         }))
++                    return;
+                 if (!processedTrees.insert(dependencyTree.get()).second)
+                     return;
+                 for (auto buffer : dependencyTree->getSourceBufferIds())
+@@ -727,7 +850,7 @@ std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees
+                 dependencyTree->getMetadata().visitDeclaredSymbols(
+                     [&](std::string_view declared) { knownNames.emplace(declared); });
+ 
+-                if (fullHierarchy ||
++                if (fullHierarchy || classDependency ||
+                     std::ranges::any_of(
+                         dependencyTree->getMetadata().nodeMeta, [](const auto& entry) {
+                             return entry.first->kind == syntax::SyntaxKind::PackageDeclaration ||
+@@ -736,7 +859,7 @@ std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees
+                     treesToProcess.push(dependencyTree);
+             }
+             else {
+-                ERROR("No doc found for {}", symbolLoc->uri->string());
++                ERROR("No doc found for {}", path->string());
+             }
+         };
+ 
+@@ -756,6 +879,7 @@ std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees
+                 loadDependency(port->nameOrKeyword);
+             for (auto type : meta.namedPortTypes)
+                 loadDependency(type->identifier);
++            visitClassTypeNames(currentTree->root(), loadDependency);
+         }
+     }
+ 
+@@ -1025,6 +1149,13 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
+     };
+ 
+     auto localSymbols = analysis->getSymbolsAtToken(declTok);
++    if (localSymbols.empty()) {
++        auto navigation = doc->getNavigationAnalysis();
++        if (navigation != analysis) {
++            analysis = std::move(navigation);
++            localSymbols = analysis->getSymbolsAtToken(declTok);
++        }
++    }
+     for (auto* symbol : localSymbols) {
+         addSymbol(symbol, analysis);
+         if (auto* port = symbol->as_if<ast::InterfacePortSymbol>()) {
+@@ -1334,6 +1465,7 @@ std::optional<std::vector<lsp::DocumentHighlight>> ServerDriver::getDocDocumentH
  
      // Find all references to the symbol in the current document
      std::vector<lsp::Location> references;
@@ -1198,7 +1406,7 @@ index 5cd6d93..4956abd 100644
      analysis->addLocalReferences(references, symbol->location, symbol->name);
      if (references.empty()) {
          return std::nullopt;
-@@ -1359,8 +1409,7 @@ void ServerDriver::addMemberReferences(std::vector<lsp::Location>& references,
+@@ -1359,8 +1491,7 @@ void ServerDriver::addMemberReferences(std::vector<lsp::Location>& references,
      auto targetDoc = getDocument(URI::fromFile(sm.getFullPath(targetBuffer)));
      auto targetName = targetSymbol.name;
  
@@ -1208,7 +1416,7 @@ index 5cd6d93..4956abd 100644
          ctx.throwIfCancelled("while finding member references");
          URI fileUri = URI::fromFile(filePath.string());
  
-@@ -1495,6 +1544,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
+@@ -1495,6 +1626,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
          return std::nullopt;
  
      std::vector<lsp::Location> references;
@@ -1216,7 +1424,7 @@ index 5cd6d93..4956abd 100644
  
      auto targetName = declTok->rawText();
  
-@@ -1557,7 +1607,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
+@@ -1557,7 +1689,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
  
          // Helper to process referencing files with a given finder function
          auto processReferencingFiles = [&](std::string_view name, auto&& finder) {
@@ -1225,7 +1433,7 @@ index 5cd6d93..4956abd 100644
                  ctx.throwIfCancelled("while finding references");
                  if (targetDoc && filePath == targetDoc->getURI().getPath())
                      continue;
-@@ -1687,12 +1737,9 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
+@@ -1687,12 +1819,9 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
  
          auto output = references.begin() + existingReferenceCount;
          for (auto it = output; it != references.end(); ++it) {
@@ -1241,7 +1449,7 @@ index 5cd6d93..4956abd 100644
              if (!duplicate) {
                  if (output != it)
                      *output = std::move(*it);
-@@ -1728,6 +1775,23 @@ std::optional<lsp::WorkspaceEdit> ServerDriver::getDocRename(const URI& uri,
+@@ -1728,6 +1857,23 @@ std::optional<lsp::WorkspaceEdit> ServerDriver::getDocRename(const URI& uri,
      return lsp::WorkspaceEdit{.changes = changes};
  }
  
@@ -1265,7 +1473,7 @@ index 5cd6d93..4956abd 100644
  void ServerDriver::publishInactiveRegions(SlangDoc& doc, const lsp::RequestContext& ctx) {
      if (!client.capabilities.inactiveRegionsSupported)
          return;
-@@ -1740,6 +1804,7 @@ void ServerDriver::publishInactiveRegions(SlangDoc& doc, const lsp::RequestConte
+@@ -1740,6 +1886,7 @@ void ServerDriver::publishInactiveRegions(SlangDoc& doc, const lsp::RequestConte
      client.onTextDocumentInactiveRegions(lsp::InactiveRegionsParams{
          .uri = doc.getURI(),
          .regions = std::move(regions),
@@ -1530,6 +1738,76 @@ index 9635833..dd1c132 100644
  
      INFO("Completion: kind={} trigger='{}' query={}", toString(ctx.lspContext.triggerKind),
           ctx.lspContext.triggerCharacter.value_or(""), toString(ctx.query->kind()));
+diff --git a/src/ast/ShallowCompilation.cpp b/src/ast/ShallowCompilation.cpp
+index 2515b33..a4dc26b 100644
+--- a/src/ast/ShallowCompilation.cpp
++++ b/src/ast/ShallowCompilation.cpp
+@@ -13,8 +13,10 @@
+ 
+ #include "slang/ast/symbols/CompilationUnitSymbols.h"
+ #include "slang/ast/symbols/InstanceSymbols.h"
++#include "slang/ast/symbols/MemberSymbols.h"
+ #include "slang/ast/symbols/ValueSymbol.h"
+ #include "slang/diagnostics/AnalysisDiags.h"
++#include <map>
+ 
+ namespace server {
+ using namespace slang;
+@@ -22,7 +24,7 @@ using namespace slang;
+ ShallowCompilation::ShallowCompilation(
+     SourceManager& sourceManager, std::shared_ptr<syntax::SyntaxTree> tree, const Bag& options,
+     const std::vector<std::shared_ptr<syntax::SyntaxTree>>& dependencies,
+-    const ServerCompilation* design) :
++    const ServerCompilation* design, bool inferClassContext) :
+     m_sourceManager(sourceManager), m_tree(std::move(tree)), m_allTrees{m_tree},
+     m_analysisOptions(options.getOrDefault<analysis::AnalysisOptions>()) {
+     m_allTrees.insert(m_allTrees.end(), dependencies.begin(), dependencies.end());
+@@ -39,6 +41,32 @@ ShallowCompilation::ShallowCompilation(
+     for (auto& depTree : m_allTrees)
+         m_compilation->addSyntaxTree(depTree);
+ 
++    if (inferClassContext) {
++        // Infer standalone class context for navigation only. Package and nested classes retain
++        // their lexical scopes, and ambiguous declarations stay in their compilation units.
++        std::map<std::string_view, const ast::Symbol*> classes;
++        for (auto* unit : m_compilation->getCompilationUnits()) {
++            for (const auto& member : unit->members()) {
++                if (member.kind != ast::SymbolKind::ClassType &&
++                    member.kind != ast::SymbolKind::GenericClassDef)
++                    continue;
++                auto [it, inserted] = classes.try_emplace(member.name, &member);
++                if (!inserted)
++                    it->second = nullptr;
++            }
++        }
++        auto& root = const_cast<ast::RootSymbol&>(m_compilation->getRootNoFinalize());
++        auto* primaryUnit = m_compilation->getCompilationUnits().front();
++        for (const auto& [name, symbol] : classes) {
++            if (symbol && symbol->getParentScope() != primaryUnit) {
++                auto* imported = m_compilation->emplace<ast::TransparentMemberSymbol>(*symbol);
++                root.addMember(*imported);
++                // Inferred imports precede every compilation unit for source-order lookup.
++                imported->setIndex(ast::SymbolIndex{0});
++            }
++        }
++    }
++
+     if (design) {
+         std::vector<std::string_view> definitionNames;
+         for (auto* symbol : m_compilation->getDefinitions()) {
+diff --git a/src/completions/CompletionContext.cpp b/src/completions/CompletionContext.cpp
+index cdd31bd..093ee56 100644
+--- a/src/completions/CompletionContext.cpp
++++ b/src/completions/CompletionContext.cpp
+@@ -114,7 +114,7 @@ CompletionContext CompletionContext::fromLocation(SlangDoc& doc, SourceLocation
+     ctx.lspContext = std::move(lspContext);
+     // Hold analysis alive so that scope/syntax pointers remain valid
+     // for the entire lifetime of the CompletionContext.
+-    ctx.analysis = doc.getAnalysis();
++    ctx.analysis = doc.getNavigationAnalysis();
+     ctx.scope = ctx.analysis->getScopeAt(loc);
+     ctx.syntax = ctx.analysis->syntaxes.getSyntaxAt(loc);
+     ctx.query = CompletionQuery::fromLocation(doc, ctx.analysis, loc, ctx.lspContext);
 diff --git a/src/completions/InstanceCompletions.cpp b/src/completions/InstanceCompletions.cpp
 index 053e7b7..89b89ec 100644
 --- a/src/completions/InstanceCompletions.cpp
@@ -1542,6 +1820,19 @@ index 053e7b7..89b89ec 100644
 +    indexer.forEachSymbol(false, [&](const std::string& name, const Indexer::GlobalSymbolLoc& entry) {
          if (!seenNames.insert(name).second)
              return;
+ 
+diff --git a/src/completions/MemberCompletions.cpp b/src/completions/MemberCompletions.cpp
+index ec5010a..60f56b4 100644
+--- a/src/completions/MemberCompletions.cpp
++++ b/src/completions/MemberCompletions.cpp
+@@ -739,7 +739,7 @@ void MemberCompletionQuery::resolve(CompletionDispatch& dispatch, lsp::Completio
+     if (!doc)
+         return;
+ 
+-    auto analysis = doc->getAnalysis(ctx);
++    auto analysis = doc->getNavigationAnalysis(ctx);
+     if (!analysis || !analysis->getCompilation())
+         return;
  
 diff --git a/src/document/DefinitionInfo.cpp b/src/document/DefinitionInfo.cpp
 index 24cb0f4..4a5f7b4 100644
@@ -1647,10 +1938,18 @@ index f266096..773bb96 100644
          auto nameSyntax = findNameSyntax(*syntax);
          if (!nameSyntax) {
 diff --git a/src/document/SlangDoc.cpp b/src/document/SlangDoc.cpp
-index 0df7a1a..695b9f4 100644
+index 0df7a1a..cc87728 100644
 --- a/src/document/SlangDoc.cpp
 +++ b/src/document/SlangDoc.cpp
-@@ -30,6 +30,7 @@
+@@ -23,6 +23,7 @@
+ #include <string_view>
+ 
+ #include "slang/ast/Compilation.h"
++#include "slang/ast/symbols/CompilationUnitSymbols.h"
+ #include "slang/diagnostics/CompilationDiags.h"
+ #include "slang/diagnostics/DeclarationsDiags.h"
+ #include "slang/diagnostics/Diagnostics.h"
+@@ -30,6 +31,7 @@
  #include "slang/diagnostics/LookupDiags.h"
  #include "slang/syntax/SyntaxTree.h"
  #include "slang/text/SourceLocation.h"
@@ -1658,7 +1957,7 @@ index 0df7a1a..695b9f4 100644
  #include "slang/text/SourceManager.h"
  #include "slang/util/String.h"
  namespace server {
-@@ -66,7 +67,15 @@ std::shared_ptr<SlangDoc> SlangDoc::fromText(ServerDriver& driver, const URI& ur
+@@ -66,7 +68,15 @@ std::shared_ptr<SlangDoc> SlangDoc::fromText(ServerDriver& driver, const URI& ur
      // Check if this path was previously cached (e.g., from an include)
      // If so, we need to replace the old buffer with the editor's version
      if (driver.sm.isCached(path)) {
@@ -1675,7 +1974,56 @@ index 0df7a1a..695b9f4 100644
          if (existingBuffer.data.size() == text.size() + 1 &&
              existingBuffer.data.substr(0, text.size()) == text) {
              return std::make_shared<SlangDoc>(driver, uri, existingBuffer);
-@@ -230,9 +239,13 @@ void SlangDoc::onChange(const std::vector<lsp::TextDocumentContentChangeEvent>&
+@@ -154,12 +164,13 @@ std::shared_ptr<syntax::SyntaxTree> SlangDoc::getSyntaxTree() {
+ 
+ std::shared_ptr<ShallowAnalysis> SlangDoc::refreshAnalysis(const lsp::RequestContext& ctx) {
+     ctx.throwIfCancelled("before analysis");
++    m_navigationAnalysis.reset();
+     auto tree = getSyntaxTree();
+     auto compilation = m_includeCompilation;
+     if (!compilation) {
+         auto dependencies = m_driver.getDependentTrees(tree);
+         compilation = std::make_shared<ShallowCompilation>(m_sourceManager, tree, m_options,
+-                                                           dependencies, m_driver.comp.get());
++                                                           dependencies, m_driver.comp.get(), false);
+     }
+     auto analysis = std::make_shared<ShallowAnalysis>(m_buffer.id, std::move(compilation));
+     auto topNames = analysis->getCompilation()->getRoot().topInstances |
+@@ -176,6 +187,33 @@ std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(const lsp::RequestContext
+     return m_analysis;
+ }
+ 
++std::shared_ptr<ShallowAnalysis> SlangDoc::getNavigationAnalysis(const lsp::RequestContext& ctx) {
++    auto analysis = getAnalysis(ctx);
++    if (m_navigationAnalysis)
++        return m_navigationAnalysis;
++
++    m_navigationAnalysis = analysis;
++    const auto& compilation = analysis->getCompilation();
++    const auto& tree = analysis->getShallowCompilation()->getSyntaxTree();
++    auto* primaryUnit = compilation->getCompilationUnits().front();
++    bool hasClassDependencies = false;
++    for (auto* unit : compilation->getCompilationUnits()) {
++        if (unit != primaryUnit) {
++            for (const auto& member : unit->members())
++                hasClassDependencies |= member.kind == ast::SymbolKind::ClassType ||
++                                        member.kind == ast::SymbolKind::GenericClassDef;
++        }
++    }
++    if (hasClassDependencies) {
++        const auto trees = compilation->getSyntaxTrees();
++        std::vector<std::shared_ptr<syntax::SyntaxTree>> dependencies(trees.begin() + 1, trees.end());
++        auto navigation = std::make_shared<ShallowCompilation>(
++            m_sourceManager, tree, m_options, dependencies, m_driver.comp.get(), true);
++        m_navigationAnalysis = std::make_shared<ShallowAnalysis>(m_buffer.id, std::move(navigation));
++    }
++    return m_navigationAnalysis;
++}
++
+ bool SlangDoc::textMatches(std::string_view text) {
+     // Just compute line offsets to validate UTF-8
+     auto bufText = getText();
+@@ -230,9 +268,13 @@ void SlangDoc::onChange(const std::vector<lsp::TextDocumentContentChangeEvent>&
          }
          auto colToOffset = [&](lsp::uint line, lsp::uint character) -> size_t {
              size_t lineStart = lineOffsets[line];
@@ -1778,9 +2126,27 @@ index 4a28cae..1928751 100644
  
  }
 diff --git a/tests/cpp/DriverTests.cpp b/tests/cpp/DriverTests.cpp
-index 7baf536..178b973 100644
+index 7baf536..088ee71 100644
 --- a/tests/cpp/DriverTests.cpp
 +++ b/tests/cpp/DriverTests.cpp
+@@ -32,7 +32,7 @@ endmodule
+     auto headerBuffer = tree->getIncludeDirectives().front().buffer.id;
+ 
+     auto compilation = std::make_shared<server::ShallowCompilation>(
+-        sm, tree, slang::Bag{}, std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>{}, nullptr);
++        sm, tree, slang::Bag{}, std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>{}, nullptr, false);
+     auto source = std::make_shared<server::ShallowAnalysis>(buffer.id, compilation);
+     auto header = std::make_shared<server::ShallowAnalysis>(headerBuffer, compilation);
+     auto location = slang::SourceLocation(headerBuffer, 7);
+@@ -73,7 +73,7 @@ endmodule
+     REQUIRE(tree->diagnostics().empty());
+     REQUIRE(tree->getIncludeDirectives().size() == 1);
+     auto compilation = std::make_shared<server::ShallowCompilation>(
+-        sm, tree, slang::Bag{}, std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>{}, nullptr);
++        sm, tree, slang::Bag{}, std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>{}, nullptr, false);
+     server::ShallowAnalysis source(buffer.id, compilation);
+     server::ShallowAnalysis header(tree->getIncludeDirectives().front().buffer.id, compilation);
+     REQUIRE(source.getSemanticDiagnostics().empty());
 @@ -492,7 +492,8 @@ TEST_CASE("Deleted and renamed includers do not prevent opening their headers")
      std::ofstream(source) << "package source;\n`include \"header.svh\"\nendpackage\n";
      std::ofstream(headerPath) << "typedef int value_t;\n";
