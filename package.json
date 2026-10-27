@@ -2,7 +2,7 @@
   "name": "verilog-systemverilog-legacy",
   "displayName": "Verilog/SystemVerilog Legacy",
   "description": "Ctags-based Verilog/SystemVerilog indexing, hovers with parameter and macro values, semantic highlighting and project linting, for VS Code 1.84",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "publisher": "local",
   "keywords": [
     "verilog",

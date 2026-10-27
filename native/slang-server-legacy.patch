@@ -277,6 +277,21 @@ index 13859d9..09d7656 100644
  
      /// Load the configuration from a given config object, reindex if needed or forced
      /// Returns false when an automatic reload cannot construct a valid replacement.
+diff --git a/include/document/ShallowAnalysis.h b/include/document/ShallowAnalysis.h
+index b76c0ab..68a0914 100644
+--- a/include/document/ShallowAnalysis.h
++++ b/include/document/ShallowAnalysis.h
+@@ -228,6 +228,10 @@ private:
+     mutable slang::flat_hash_map<const slang::ast::DefinitionSymbol*, const slang::ast::Scope*>
+         m_interfaceFallbackScopes;
+ 
++    mutable slang::flat_hash_map<
++        std::pair<const slang::parsing::Token*, const slang::ast::Scope*>, const slang::ast::Type*>
++        m_queryTypes;
++
+     const GenvarElaboration* getGenvarElaborationAtToken(const slang::parsing::Token* node) const;
+ 
+     const slang::ast::Symbol* getAssignmentPatternTargetSymbol(
 diff --git a/include/document/SlangDoc.h b/include/document/SlangDoc.h
 index 999340e..3f5c822 100644
 --- a/include/document/SlangDoc.h
@@ -1545,7 +1560,7 @@ index 24cb0f4..4a5f7b4 100644
                                 ? fmt::format("{}:{}:{}", path.filename().string(), line, column)
                                 : fmt::format("`{}`", label);
 diff --git a/src/document/ShallowAnalysis.cpp b/src/document/ShallowAnalysis.cpp
-index f266096..9dba927 100644
+index f266096..773bb96 100644
 --- a/src/document/ShallowAnalysis.cpp
 +++ b/src/document/ShallowAnalysis.cpp
 @@ -20,6 +20,7 @@
@@ -1573,7 +1588,13 @@ index f266096..9dba927 100644
      }
      else if (ast::InstanceSymbol::isKind(symbol->kind)) {
          return &symbol->as<ast::InstanceSymbol>().body.as<ast::Scope>();
-@@ -633,6 +634,23 @@ slang::SmallVector<const ast::Symbol*, 2> ShallowAnalysis::getSymbolsAtToken(
+@@ -629,10 +630,33 @@ slang::SmallVector<const ast::Symbol*, 2> ShallowAnalysis::getSymbolsAtToken(
+         return symbols;
+     }
+ 
++    // Retain the indexed token as the cache key even when macro arguments are reparsed below.
++    const auto* sourceToken = declTok;
+     auto syntax = syntaxes.getTokenParent(declTok);
      if (!syntax) {
          return symbols;
      }
@@ -1586,10 +1607,14 @@ index f266096..9dba927 100644
 +        }
 +        if (expression && !syntax::NameSyntax::isKind(expression->kind)) {
 +            for (auto* scope : m_symbolIndexer.getScopesForSyntax(*expression)) {
-+                ast::ASTContext context(*scope, ast::LookupLocation::max);
-+                const auto& bound = ast::Expression::bind(*expression, context);
-+                if (!bound.bad())
-+                    addSymbol(bound.type);
++                auto [it, inserted] = m_queryTypes.try_emplace({sourceToken, scope}, nullptr);
++                if (inserted) {
++                    ast::ASTContext context(*scope, ast::LookupLocation::max);
++                    const auto& bound = ast::Expression::bind(*expression, context);
++                    if (!bound.bad())
++                        it->second = bound.type;
++                }
++                addSymbol(it->second);
 +            }
 +            return symbols;
 +        }
@@ -1597,7 +1622,7 @@ index f266096..9dba927 100644
      if (syntax->kind == syntax::SyntaxKind::SuperHandle) {
          // Slang only accepts 'super' as part of a qualified lookup, while completion
          // queries need the receiver alone, including when the member is unfinished.
-@@ -763,6 +781,20 @@ slang::SmallVector<const ast::Symbol*, 2> ShallowAnalysis::getSymbolsAtToken(
+@@ -763,6 +787,23 @@ slang::SmallVector<const ast::Symbol*, 2> ShallowAnalysis::getSymbolsAtToken(
      }
  
      auto resolveInScope = [&](const ast::Scope* scope) -> const ast::Symbol* {
@@ -1605,9 +1630,12 @@ index f266096..9dba927 100644
 +        if (!virtualType && syntax->kind == syntax::SyntaxKind::DotMemberClause)
 +            virtualType = syntax->parent->as_if<syntax::VirtualInterfaceTypeSyntax>();
 +        if (virtualType) {
-+            ast::ASTContext context(*scope, ast::LookupLocation::max);
-+            const auto& type = ast::VirtualInterfaceType::fromSyntax(context, *virtualType);
-+            auto* iface = type.as_if<ast::VirtualInterfaceType>();
++            auto [it, inserted] = m_queryTypes.try_emplace({sourceToken, scope}, nullptr);
++            if (inserted) {
++                ast::ASTContext context(*scope, ast::LookupLocation::max);
++                it->second = &ast::VirtualInterfaceType::fromSyntax(context, *virtualType);
++            }
++            auto* iface = it->second->as_if<ast::VirtualInterfaceType>();
 +            if (!iface)
 +                return nullptr;
 +            if (virtualType->name == *declTok)
@@ -1737,7 +1765,7 @@ index 4a56e91..cbc064a 100644
          case syntax::SyntaxKind::TaskDeclaration:
              return lsp::SymbolKind::Function;
 diff --git a/src/util/VersionInfo.cpp.in b/src/util/VersionInfo.cpp.in
-index 4a28cae..3e39178 100644
+index 4a28cae..1928751 100644
 --- a/src/util/VersionInfo.cpp.in
 +++ b/src/util/VersionInfo.cpp.in
 @@ -25,7 +25,7 @@ int VersionInfo::getPatch() {
@@ -1745,7 +1773,7 @@ index 4a28cae..3e39178 100644
  
  string_view VersionInfo::getHash() {
 -    return "@SLANG_SERVER_VERSION_HASH@"sv;
-+    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.4"sv;
++    return "@SLANG_SERVER_VERSION_HASH@-legacy0.6.5"sv;
  }
  
  }

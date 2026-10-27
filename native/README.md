@@ -3,11 +3,15 @@
 `slang-server-legacy.patch` applies to upstream
 [60857ce8b4a01b6d11443fb1af1eb41c261c702c](https://github.com/hudson-trading/slang-server/tree/60857ce8b4a01b6d11443fb1af1eb41c261c702c),
 with its direct submodules initialized. The resulting server identifies itself as
-`0.3.1+60857ce-legacy0.6.4`. Keep upstream MIT notices.
+`0.3.1+60857ce-legacy0.6.5`. Keep upstream MIT notices.
+
+The 0.6.5 patch also bounds repeated virtual-interface and expression-member query
+allocations by reusing type bindings within each analysis and semantic scope.
+Source edits invalidate those bindings.
 
 The 0.6.4 patch repairs named-declaration workspace search, virtual-interface
 navigation in UVM projects, and member access after expressions such as function
-calls and casts. Upgrade both the native service and extension to 0.6.4; updating the VSIX
+calls and casts. Upgrade both the native service and extension to 0.6.5; updating the VSIX
 alone does not install these native repairs. See the [real-project checks](tests/README.md#uvm-projects).
 
 Extension 0.6.3 remains compatible with the rebuilt service. Its published kit
@@ -52,7 +56,7 @@ from upstream; existing caches can be supplied through the usual
 
 ## Target ABI
 
-The 0.6.4 Linux x86_64 binary is built with GCC 11.4 and a glibc 2.17
+The 0.6.5 Linux x86_64 binary is built with GCC 11.4 and a glibc 2.17
 sysroot derived from CentOS 7.9 packages. Add these options to the build above:
 
 ```sh

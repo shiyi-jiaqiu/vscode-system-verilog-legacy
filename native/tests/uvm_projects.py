@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from urllib.parse import unquote
 
 # The existing protocol harness consumes SERVER from sys.argv.
 from review_protocol import Server
@@ -23,7 +24,7 @@ def position(text, anchor, prefix=''):
 
 
 def check_project(name, original, uvm, slang, dut=None):
-    with tempfile.TemporaryDirectory(prefix=f'verilog-uvm-{name}-') as temporary:
+    with tempfile.TemporaryDirectory(prefix=f'verilog uvm 验证 %20-{name}-') as temporary:
         root = Path(temporary) / name
         shutil.copytree(original, root, ignore=shutil.ignore_patterns(
             '.slang', '.vscode', 'server.stderr', 'protocol.json'))
@@ -81,21 +82,21 @@ def check_project(name, original, uvm, slang, dut=None):
                 definitions = server.request('textDocument/definition', server.at(file, line, column))
                 assert definitions, (file, anchor)
                 expected_line = position(target.read_text(), declaration)[0]
-                assert any(d['uri'] == target.as_uri() and d['range']['start']['line'] == expected_line
+                assert any(d['uri'] == unquote(target.as_uri()) and d['range']['start']['line'] == expected_line
                            for d in definitions), (file, anchor, definitions, str(target), expected_line)
                 assert server.request('textDocument/hover', server.at(file, line, column)), (file, anchor)
             server.open(top)
             for file in {top, checks[0][0]}:
-                diagnostics = server.diags[server.uri(file)]['diagnostics']
+                diagnostics = server.diags[unquote(server.uri(file))]['diagnostics']
                 assert not [d for d in diagnostics if d['severity'] == 1], (file, diagnostics)
             original_top = (root / top).read_text()
             broken_top = original_top.replace('endmodule', 'initial uvm_navigation_missing = 1;\nendmodule', 1)
             server.change(top, broken_top)
-            errors = server.diags[server.uri(top)]['diagnostics']
+            errors = server.diags[unquote(server.uri(top))]['diagnostics']
             assert any(d.get('code') == 'UndeclaredIdentifier' and 'uvm_navigation_missing' in d['message']
                        for d in errors), errors
             server.change(top, original_top, 3)
-            assert not [d for d in server.diags[server.uri(top)]['diagnostics'] if d['severity'] == 1]
+            assert not [d for d in server.diags[unquote(server.uri(top))]['diagnostics'] if d['severity'] == 1]
             cli_results = {}
             for mode in ['--parse-only', '--lint-only', '--top']:
                 output = root / 'cli.json'

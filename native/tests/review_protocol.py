@@ -150,6 +150,49 @@ class ReviewTests(unittest.TestCase):
     def names(self):
         return {entry['name'] for entry in self.server.request('workspace/symbol', {'query': ''})}
 
+    def test_SV_repeated_type_queries_keep_memory_bounded(self):
+        fields = '\n'.join(f'logic [63:0] data_{i};' for i in range(500))
+        params = ', '.join(f'input int arg{i}' for i in range(60))
+        args = ', '.join(str(i) for i in range(60))
+        cases = [
+            ('virtual-interface', f'interface bus;\n{fields}\nmodport mp(output data_0);\n'
+             'endinterface\nclass C; virtual bus.mp vif; endclass\n', 'bus.mp vif', 600),
+            ('call-result', 'package p; typedef struct packed { int payload; } packet_t; '
+             f"function automatic packet_t make_packet({params}); return '0; endfunction endpackage\n"
+             f'module top; import p::*; initial $display(make_packet({args}).payload); endmodule\n',
+             'payload);', 1500),
+        ]
+        self.config()
+        for name, text, anchor, count in cases:
+            with self.subTest(name=name):
+                self.write('query.sv', text)
+                s = self.start()
+                try:
+                    s.open('query.sv')
+                    offset = text.index(anchor)
+                    query = s.at('query.sv', text[:offset].count('\n'),
+                                  offset - text.rfind('\n', 0, offset) - 1)
+                    for _ in range(15):
+                        self.assertTrue(s.request('textDocument/hover', query))
+                    status = Path(f'/proc/{s.proc.pid}/status')
+                    before = int(next(line.split()[1] for line in status.read_text().splitlines()
+                                      if line.startswith('VmRSS:')))
+                    for _ in range(count):
+                        self.assertTrue(s.request('textDocument/hover', query))
+                    after = int(next(line.split()[1] for line in status.read_text().splitlines()
+                                     if line.startswith('VmRSS:')))
+                    self.assertLess(after - before, 2 * 1024, f'{name}: grew {after - before} KiB')
+                    self.assertTrue(s.request('textDocument/definition', query))
+                    changed = text.replace('bus.mp vif', 'missing_bus.mp vif') if name == 'virtual-interface' \
+                        else text.replace('int payload', 'int changed')
+                    s.change('query.sv', changed)
+                    self.assertFalse(s.request('textDocument/definition', query))
+                    s.change('query.sv', text, 3)
+                    self.assertTrue(s.request('textDocument/definition', query))
+                finally:
+                    s.close()
+                    self.server = None
+
     def test_SV_macro_typedefs_are_indexed_cold_and_refresh_from_headers(self):
         self.config()
         self.write('types.svh', '`define DECL_T(n) typedef struct packed { int payload; } n;\n')

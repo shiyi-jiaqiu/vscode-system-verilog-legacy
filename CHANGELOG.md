@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.5] - 2026-10-27
+
+- Reuse semantic type bindings for repeated virtual-interface and expression-member queries within each analysis and scope, preventing retained compilation allocations. Edits rebuild the bindings. Requires the matching rebuilt native service.
+- Repair UVM verification URI comparisons and diagnostic lookup for project paths containing spaces, Unicode and literal percent escapes.
+
 ## [0.6.4] - 2026-10-26
 
 - Include class declarations in native workspace symbol search, preserving compiler scope rules for navigation and completion.
